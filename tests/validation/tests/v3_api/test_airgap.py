@@ -2,7 +2,7 @@ import base64
 import os
 import pytest
 import time
-from lib.aws import AWS_USER
+from lib.aws import AWS_WINDOWS_USER, AWS_WINDOWS_AMI, AWS_LINUX_USER
 from .common import (
     AmazonWebServices, run_command,
     TEST_IMAGE, TEST_IMAGE_NGINX, TEST_IMAGE_OS_BASE
@@ -30,6 +30,9 @@ SSH_KEY_DIR = os.path.join(os.path.dirname(os.path.realpath(__file__)),
 
 
 def test_deploy_airgap_rancher():
+    assert RANCHER_SERVER_VERSION.startswith("v"), \
+        "The RANCHER_SERVER_VERSION should be a released version"
+
     bastion_node = deploy_bastion_server()
     save_res, load_res = add_rancher_images_to_private_registry(bastion_node)
     assert "Image pull success: rancher/rancher:{}".format(
@@ -47,10 +50,11 @@ def test_deploy_airgap_rancher():
         " settings:\nPrivate Registry URL: {}\nPrivate Registry User: {}\n"
         "Private Registry Password: (default admin password or "
         "whatever you set in RANCHER_BASTION_PASSWORD)\n".format(
-            bastion_node.ssh_key_name, AWS_USER, bastion_node.host_name,
-            bastion_node.ssh_key_name, AWS_USER, ag_node.private_ip_address,
-            public_dns, RANCHER_AG_INTERNAL_HOSTNAME,
-            bastion_node.host_name, PRIVATE_REGISTRY_USERNAME))
+            bastion_node.ssh_key_name, AWS_LINUX_USER, bastion_node.host_name,
+            bastion_node.ssh_key_name, AWS_LINUX_USER,
+            ag_node.private_ip_address, public_dns,
+            RANCHER_AG_INTERNAL_HOSTNAME, bastion_node.host_name,
+            PRIVATE_REGISTRY_USERNAME))
 
 
 def test_deploy_airgap_nodes():
@@ -64,7 +68,7 @@ def test_deploy_airgap_nodes():
         'then running the following command (with the quotes):\n'
         'ssh -i {}.pem {}@NODE_PRIVATE_IP '
         '"docker login {} -u {} -p {} && COMMANDS"'.format(
-            NUMBER_OF_INSTANCES, bastion_node.ssh_key_name, AWS_USER,
+            NUMBER_OF_INSTANCES, bastion_node.ssh_key_name, AWS_LINUX_USER,
             bastion_node.host_name, PRIVATE_REGISTRY_USERNAME,
             PRIVATE_REGISTRY_PASSWORD))
     for ag_node in ag_nodes:
@@ -72,6 +76,29 @@ def test_deploy_airgap_nodes():
         assert ag_node.public_ip_address is None
 
     deploy_airgap_nodes(bastion_node, ag_nodes)
+
+
+def test_deploy_windows_node():
+    node_name = random_test_name(HOST_NAME + "-bastion-win")
+    nodes = AmazonWebServices().create_multiple_nodes(
+        1, node_name, ami=AWS_WINDOWS_AMI, ssh_user=AWS_WINDOWS_USER)
+    assert len(nodes) == 1, "should be 1 windows node"
+
+    bastion_node = nodes[0]
+    print("Bastion Server (Windows) Details:\nNAME: {}\nHOST NAME: {}\n"
+          "INSTANCE ID: {}\n".format(node_name, bastion_node.host_name,
+                                     bastion_node.provider_node_id))
+    return bastion_node
+
+
+def test_prepare_registry_for_windows():
+    # create the Linux bastion server
+    linux_node = deploy_bastion_server()
+    # deploy the private registry but not push any images
+    save_res, load_res = add_rancher_images_to_private_registry(
+        linux_node, push_images=False)
+    # create the Windows bastion server
+    windows_node = test_deploy_windows_node()
 
 
 def test_add_rancher_images_to_private_registry():
@@ -126,7 +153,7 @@ def deploy_bastion_server():
         '-o UserKnownHostsFile=/dev/null -r {}/airgap/basic-registry/ ' \
         '{}@{}:~/basic-registry/'.format(
             SSH_KEY_DIR, bastion_node.ssh_key_name, RESOURCE_DIR,
-            AWS_USER, bastion_node.host_name)
+            AWS_LINUX_USER, bastion_node.host_name)
     run_command(get_resources_command, log_out=False)
 
     generate_certs_command = \
@@ -264,8 +291,8 @@ def prepare_airgap_node(bastion_node, number_of_nodes):
         ag_node_update_docker = \
             'ssh -i "{}.pem" -o StrictHostKeyChecking=no {}@{} ' \
             '"sudo usermod -aG docker {}"'.format(
-                bastion_node.ssh_key_name, AWS_USER,
-                ag_node.private_ip_address, AWS_USER)
+                bastion_node.ssh_key_name, AWS_LINUX_USER,
+                ag_node.private_ip_address, AWS_LINUX_USER)
         bastion_node.execute_command(ag_node_update_docker)
 
         # Update docker in node with bastion cert details
@@ -273,9 +300,9 @@ def prepare_airgap_node(bastion_node, number_of_nodes):
             'ssh -i "{}.pem" -o StrictHostKeyChecking=no {}@{} ' \
             '"sudo mkdir -p /etc/docker/certs.d/{} && ' \
             'sudo chown {} /etc/docker/certs.d/{}"'.format(
-                bastion_node.ssh_key_name, AWS_USER,
+                bastion_node.ssh_key_name, AWS_LINUX_USER,
                 ag_node.private_ip_address, bastion_node.host_name,
-                AWS_USER, bastion_node.host_name)
+                AWS_LINUX_USER, bastion_node.host_name)
         bastion_node.execute_command(ag_node_create_dir)
 
         ag_node_write_cert = \
@@ -283,13 +310,13 @@ def prepare_airgap_node(bastion_node, number_of_nodes):
             '/etc/docker/certs.d/{}/ca.crt ' \
             '{}@{}:/etc/docker/certs.d/{}/ca.crt'.format(
                 bastion_node.ssh_key_name, bastion_node.host_name,
-                AWS_USER, ag_node.private_ip_address, bastion_node.host_name)
+                AWS_LINUX_USER, ag_node.private_ip_address, bastion_node.host_name)
         bastion_node.execute_command(ag_node_write_cert)
 
         ag_node_restart_docker = \
             'ssh -i "{}.pem" -o StrictHostKeyChecking=no {}@{} ' \
             '"sudo service docker restart"'.format(
-                bastion_node.ssh_key_name, AWS_USER,
+                bastion_node.ssh_key_name, AWS_LINUX_USER,
                 ag_node.private_ip_address)
         bastion_node.execute_command(ag_node_restart_docker)
 
@@ -352,8 +379,8 @@ def run_command_on_airgap_node(bastion_node, ag_node, cmd, log_out=False):
     ag_command = \
         'ssh -i "{}.pem" -o StrictHostKeyChecking=no {}@{} ' \
         '"{} && {}"'.format(
-            bastion_node.ssh_key_name, AWS_USER, ag_node.private_ip_address,
-            docker_login_command, cmd)
+            bastion_node.ssh_key_name, AWS_LINUX_USER,
+            ag_node.private_ip_address, docker_login_command, cmd)
     result = bastion_node.execute_command(ag_command)
     if log_out:
         print("Running command: {}".format(ag_command))

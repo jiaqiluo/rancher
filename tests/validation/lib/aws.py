@@ -28,11 +28,13 @@ AWS_IAM_PROFILE = os.environ.get("AWS_IAM_PROFILE", "")
 # by default the public Ubuntu 18.04 AMI is used
 AWS_DEFAULT_AMI = "ami-0d5d9d301c853a04a"
 AWS_DEFAULT_USER = "ubuntu"
-AWS_AMI = os.environ.get("AWS_AMI", AWS_DEFAULT_AMI)
-AWS_USER = os.environ.get("AWS_USER", AWS_DEFAULT_USER)
+AWS_LINUX_AMI = os.environ.get("AWS_LINUX_AMI", AWS_DEFAULT_AMI)
+AWS_LINUX_USER = os.environ.get("AWS_LINUX_USER", AWS_DEFAULT_USER)
 AWS_VOLUME_SIZE = os.environ.get("AWS_VOLUME_SIZE", "50")
 AWS_INSTANCE_TYPE = os.environ.get("AWS_INSTANCE_TYPE", 't3a.medium')
 
+AWS_WINDOWS_AMI = os.environ.get("AWS_WINDOWS_AMI", None)
+AWS_WINDOWS_USER = os.environ.get("AWS_WINDOWS_USER", "Administrator")
 AWS_WINDOWS_VOLUME_SIZE = os.environ.get("AWS_WINDOWS_VOLUME_SIZE", "100")
 AWS_WINDOWS_INSTANCE_TYPE = 't3.xlarge'
 
@@ -74,11 +76,14 @@ class AmazonWebServices(CloudProviderBase):
         self.created_node = []
         self.created_keys = []
 
-    def create_node(self, node_name, ami=AWS_AMI, ssh_user=AWS_USER,
-                    key_name=None, wait_for_ready=True, public_ip=True):
+    def create_node(self, node_name, ami=AWS_LINUX_AMI,
+                    ssh_user=AWS_LINUX_USER, key_name=None,
+                    wait_for_ready=True, public_ip=True):
         volume_size = AWS_VOLUME_SIZE
         instance_type = AWS_INSTANCE_TYPE
         if ssh_user == "Administrator":
+            assert ami is not None, \
+                "the Windows AMI is missing, stop provisioning the node"
             volume_size = AWS_WINDOWS_VOLUME_SIZE
             instance_type = AWS_WINDOWS_INSTANCE_TYPE
 
@@ -151,7 +156,7 @@ class AmazonWebServices(CloudProviderBase):
         return node
 
     def create_multiple_nodes(self, number_of_nodes, node_name_prefix,
-                              ami=AWS_AMI, ssh_user=AWS_USER,
+                              ami=AWS_LINUX_AMI, ssh_user=AWS_LINUX_USER,
                               key_name=None, wait_for_ready=True,
                               public_ip=True):
         nodes = []
@@ -198,7 +203,8 @@ class AmazonWebServices(CloudProviderBase):
                 private_ip_address=aws_node.get('PrivateIpAddress'),
                 state=aws_node['State']['Name'])
             if ssh_access:
-                node.ssh_user = AWS_USER
+                # TODO: ssh user for windows or linux
+                node.ssh_user = AWS_LINUX_USER
                 node.ssh_key_name = AWS_SSH_KEY_NAME.replace('.pem', '')
                 node.ssh_key_path = self.master_ssh_key_path
                 node.ssh_key = self.master_ssh_key

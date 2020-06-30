@@ -7,7 +7,7 @@ from .common import random_test_name
 from .test_rke_cluster_provisioning import create_custom_host_from_nodes
 from .test_rke_cluster_provisioning import HOST_NAME
 
-from lib.aws import AmazonWebServices, AWS_DEFAULT_AMI, AWS_DEFAULT_USER
+from lib.aws import AmazonWebServices, AWS_WINDOWS_AMI, AWS_WINDOWS_USER
 
 
 def test_windows_provisioning():
@@ -16,12 +16,12 @@ def test_windows_provisioning():
 
     win_nodes = \
         AmazonWebServices().create_multiple_nodes(
-            len(node_roles_windows), random_test_name(HOST_NAME))
+            len(node_roles_windows), random_test_name(HOST_NAME),
+            ami=AWS_WINDOWS_AMI, ssh_user=AWS_WINDOWS_USER)
 
     linux_nodes = \
         AmazonWebServices().create_multiple_nodes(
-            len(node_roles_linux), random_test_name(HOST_NAME),
-            ami=AWS_DEFAULT_AMI, ssh_user=AWS_DEFAULT_USER)
+            len(node_roles_linux), random_test_name(HOST_NAME))
 
     nodes = linux_nodes + win_nodes
     node_roles = node_roles_linux + node_roles_windows
