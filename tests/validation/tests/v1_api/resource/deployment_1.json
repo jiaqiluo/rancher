@@ -1,0 +1,38 @@
+{
+  "type": "apps.deployment",
+  "metadata": {
+    "namespace": "default",
+    "name": "test-deployment-1"
+  },
+  "metadata.annotations": {},
+  "metadata.labels": {},
+  "spec": {
+    "replicas": 1,
+    "template": {
+      "spec": {
+        "restartPolicy": "Always",
+        "containers": [
+          {
+            "imagePullPolicy": "Always",
+            "volumeMounts": [],
+            "image": "sangeetha/mytestcontainer",
+            "name": "test-deployment-1"
+          }
+        ],
+        "imagePullSecrets": [],
+        "volumes": [],
+        "affinity": {}
+      },
+      "metadata": {
+        "labels": {
+          "workload.user.cattle.io/workloadselector": "apps.deployment-default-test-deployment-1"
+        }
+      }
+    },
+    "selector": {
+      "matchLabels": {
+        "workload.user.cattle.io/workloadselector": "apps.deployment-default-test-deployment-1"
+      }
+    }
+  }
+}

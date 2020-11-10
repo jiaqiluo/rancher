@@ -1,0 +1,21 @@
+metadata:
+  name: test-workload-1
+  namespace: default
+spec:
+  selector:
+    matchLabels:
+      workload.user.cattle.io/workloadselector: apps.deployment-default-test-workload-1
+  template:
+    metadata:
+      labels:
+        workload.user.cattle.io/workloadselector: apps.deployment-default-test-workload-1
+    spec:
+      containers:
+        - imagePullPolicy: Always
+          image: nginx
+          name: test-workload-1
+      affinity: null
+      imagePullSecrets: null
+      restartPolicy: Always
+      volumes: null
+  replicas: 1

@@ -45,3 +45,18 @@ def test_wl_rbac_project_member(remove_resource):
 First, we need to pass the fixture as an argument to the function to registry it to the scope of the function;
 second, we need to call this fixture after creating a new resource, in this example it is a workload.
 In such way, the workload will be removed automatically when this test finishes no matter it succeeds or fails.
+
+# how to user the new rancher client for the new api v1
+Before we dive into the technical details, let's clarify a confusion here: 
+
+Yes, the new api is v1, and the old api is v3. 
+
+The new api is v1 because it is the beginning of Rancher's new api framework,
+and it is used for Rancher's new UI, the cluster explorer, to talk with the backend. 
+
+
+The support for the new v1 api is added to the Rancher client module. 
+Currenly there are 2 levels of the client: global client and cluster clint. 
+(The old v3 api has one more: project client)
+
+

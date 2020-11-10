@@ -1,0 +1,44 @@
+{
+  "type": "apps.daemonset",
+  "metadata": {
+    "namespace": "default",
+    "name": "test-daemonset-1"
+  },
+  "metadata.annotations": {
+  },
+  "metadata.labels": {
+  },
+  "spec": {
+    "replicas": 1,
+    "template": {
+      "spec": {
+        "restartPolicy": "Always",
+        "containers": [
+          {
+            "imagePullPolicy": "Always",
+            "volumeMounts": [
+            ],
+            "image": "sangeetha/mytestcontainer",
+            "name": "test-daemonset-1"
+          }
+        ],
+        "imagePullSecrets": [
+        ],
+        "volumes": [
+        ],
+        "affinity": {
+        }
+      },
+      "metadata": {
+        "labels": {
+          "workload.user.cattle.io/workloadselector": "apps.daemonset-default-test-daemonset-1"
+        }
+      }
+    },
+    "selector": {
+      "matchLabels": {
+        "workload.user.cattle.io/workloadselector": "apps.daemonset-default-test-daemonset-1"
+      }
+    }
+  }
+}
