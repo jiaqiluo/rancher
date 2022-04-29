@@ -57,6 +57,7 @@ import (
 const (
 	DefaultBackupIntervalHours = 12
 	DefaultBackupRetention     = 6
+	RKEReconcileRetryLimit     = 10
 	s3TransportTimeout         = 10
 	registrySecretKey          = "privateRegistrySecret"
 	s3SecretKey                = "s3CredentialSecret"
@@ -293,6 +294,9 @@ func (r *Store) Create(apiContext *types.APIContext, schema *types.Schema, data 
 		return nil, err
 	}
 
+	if retryLimit, _ := values.GetValue(data, "rkeReconcileRetryLimit"); retryLimit.(int) == 0 {
+		values.PutValue(data, RKEReconcileRetryLimit, "rkeReconcileRetryLimit")
+	}
 	data, err = r.Store.Create(apiContext, schema, data)
 	if err != nil {
 		if allSecrets.regSecret != nil {

@@ -352,7 +352,12 @@ func setVersion(cluster *v3.Cluster) {
 
 func (p *Provisioner) update(cluster *v3.Cluster, create bool) (*v3.Cluster, error) {
 	cluster, err := p.reconcileCluster(cluster, create)
-	if err != nil || imported.IsAdministratedByProvisioningCluster(cluster) {
+	if err != nil {
+		// update the retry count in the status
+		cluster.Status.RKEReconcileRetryCount++
+		return p.Clusters.Update(cluster)
+	}
+	if imported.IsAdministratedByProvisioningCluster(cluster) {
 		return cluster, err
 	}
 
@@ -469,6 +474,11 @@ var errKeyRotationFailed = errors.New("encryption key rotation failed, please re
 func (p *Provisioner) reconcileCluster(cluster *v3.Cluster, create bool) (*v3.Cluster, error) {
 	if skipLocalK3sImported(cluster) {
 		reconcileACE(cluster)
+		return cluster, nil
+	}
+
+	if cluster.Status.RKEReconcileRetryCount >= cluster.Spec.RKEReconcileRetryLimit {
+		logrus.Debugf("skip the cluster because RKE reconcile retry count hits the limit")
 		return cluster, nil
 	}
 

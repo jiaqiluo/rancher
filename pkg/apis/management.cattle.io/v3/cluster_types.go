@@ -117,6 +117,7 @@ type ClusterSpecBase struct {
 	WindowsPreferedCluster               bool                                    `json:"windowsPreferedCluster" norman:"noupdate"`
 	LocalClusterAuthEndpoint             LocalClusterAuthEndpoint                `json:"localClusterAuthEndpoint,omitempty"`
 	ScheduledClusterScan                 *ScheduledClusterScan                   `json:"scheduledClusterScan,omitempty"`
+	RKEReconcileRetryLimit               int                                     `json:"rkeReconcileRetryLimit,omitempty"`
 }
 
 type ClusterSpec struct {
@@ -191,6 +192,7 @@ type ClusterStatus struct {
 	OpenStackSecret                      string                      `json:"openStackSecret,omitempty" norman:"nocreate,noupdate"`
 	AADClientSecret                      string                      `json:"aadClientSecret,omitempty" norman:"nocreate,noupdate"`
 	AADClientCertSecret                  string                      `json:"aadClientCertSecret,omitempty" norman:"nocreate,noupdate"`
+	RKEReconcileRetryCount               int                         `json:"rkeReconcileRetryCount,omitempty"`
 }
 
 type ClusterComponentStatus struct {
