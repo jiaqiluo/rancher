@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/Masterminds/semver/v3"
 	rancherv1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
@@ -60,6 +61,10 @@ var (
 	}
 )
 
+// globalCounter keeps track of the number of clusters for which the handler is concurrently uninstalling the Fleet-based app.
+// An atomic integer is used for efficiency, as it is lighter than a traditional lock.
+var globalCounter atomic.Int32
+
 type handler struct {
 	clusterRegistrationTokens mgmtv3.ClusterRegistrationTokenCache
 	bundles                   fleetcontrollers.BundleClient
@@ -79,8 +84,7 @@ func Register(ctx context.Context, clients *wrangler.Context) {
 		secrets:                   clients.Core.Secret(),
 	}
 
-	clients.Provisioning.Cluster().OnChange(ctx, "uninstall-suc-managed-chart", h.OnChangeUninstallSUCManagedChart)
-	clients.Provisioning.Cluster().OnChange(ctx, "uninstall-system-agent-bundle", h.OnChangeUninstallSystemAgentBundle)
+	clients.Provisioning.Cluster().OnChange(ctx, "uninstall-fleet-based-apps", h.OnChangeUninstallFleetBasedApps)
 	clients.Provisioning.Cluster().OnChange(ctx, "install-system-agent", h.OnChangeInstallSystemAgent)
 
 }
@@ -381,7 +385,7 @@ func CurrentVersionResolvesGH5551(version string) bool {
 	return curSemVer.GreaterThanEqual(GH5551FixedVersions[int(minor)])
 }
 
-func (h *handler) OnChangeUninstallSUCManagedChart(_ string, cluster *rancherv1.Cluster) (*rancherv1.Cluster, error) {
+func (h *handler) OnChangeUninstallFleetBasedApps(_ string, cluster *rancherv1.Cluster) (*rancherv1.Cluster, error) {
 	if cluster == nil || cluster.DeletionTimestamp != nil {
 		return cluster, nil
 	}
@@ -391,69 +395,66 @@ func (h *handler) OnChangeUninstallSUCManagedChart(_ string, cluster *rancherv1.
 	if cluster.Status.FleetWorkspaceName == "" {
 		return cluster, nil
 	}
-	sucName := capr.SafeConcatName(48, cluster.Name, "managed", "system-upgrade-controller")
-	logrus.Infof("==== [managed-system-agent] attempt to uninstall SUC managed chart [%s] on %s", sucName, cluster.Name)
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		app, err := h.managedCharts.Cache().Get(cluster.Status.FleetWorkspaceName, sucName)
+
+	if globalCounter.Load() < int32(settings.K3sBasedUpgraderUninstallConcurrency.GetInt()) {
+		globalCounter.Add(1)
+
+		// uninstall the managed system-upgrade-controller app
+		sucName := capr.SafeConcatName(48, cluster.Name, "managed", "system-upgrade-controller")
+		logrus.Infof("==== [managed-system-agent] attempt to uninstall SUC managed chart [%s] on %s", sucName, cluster.Name)
+		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			app, err := h.managedCharts.Cache().Get(cluster.Status.FleetWorkspaceName, sucName)
+			if err != nil {
+				if errors.IsNotFound(err) {
+					logrus.Infof("==== [managed-system-agent] system-upgrade-controller managed chart does not exist")
+					return nil
+				}
+				return err
+			}
+			if err := h.managedCharts.Delete(app.Namespace, app.Name, &metav1.DeleteOptions{}); err != nil {
+				logrus.Errorf("==== [managed-system-agent] hit errors: %v", err)
+				if errors.IsNotFound(err) {
+					return nil
+				}
+				return err
+			}
+			logrus.Infof("==== [managed-system-agent] system-upgrade-controller managed charts deleted")
+			return nil
+		})
 		if err != nil {
-			if errors.IsNotFound(err) {
-				logrus.Infof("==== [managed-system-agent] system-upgrade-controller managed chart does not exist")
-				return nil
-			}
-			return err
+			return cluster, fmt.Errorf("failed to delete system-upgrade-controller managed chart: %v", err)
 		}
-		if err := h.managedCharts.Delete(app.Namespace, app.Name, &metav1.DeleteOptions{}); err != nil {
-			logrus.Errorf("==== [managed-system-agent] hit errors: %v", err)
-			if errors.IsNotFound(err) {
-				return nil
+
+		// uninstall the Fleet-managed system agent chart
+		systemAgent := capr.SafeConcatName(capr.MaxHelmReleaseNameLength, cluster.Name, "managed", "system", "agent")
+		logrus.Infof("==== [managed-system-agent] attempt to uninstall system-agent  [%s] on %s", systemAgent, cluster.Name)
+		err = retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			app, err := h.bundles.Get(cluster.Status.FleetWorkspaceName, systemAgent, metav1.GetOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					logrus.Infof("==== [managed-system-agent] system agent bundle does not exist")
+					return nil
+				}
+				return err
 			}
-			return err
-		}
-		logrus.Infof("==== [managed-system-agent] system-upgrade-controller managed charts deleted")
-		return nil
-	})
-	if err != nil {
-		return cluster, fmt.Errorf("failed to delete system-upgrade-controller managed chart: %v", err)
-	}
-
-	return cluster, nil
-}
-
-func (h *handler) OnChangeUninstallSystemAgentBundle(_ string, cluster *rancherv1.Cluster) (*rancherv1.Cluster, error) {
-	if cluster == nil || cluster.DeletionTimestamp != nil {
-		return cluster, nil
-	}
-	if cluster.Spec.RKEConfig == nil {
-		return cluster, nil
-	}
-	// the absence of the FleetWorkspaceName indicates that Fleet is not ready on the cluster, so do Fleet bundles
-	if cluster.Status.FleetWorkspaceName == "" {
-		return cluster, nil
-	}
-
-	systemAgent := capr.SafeConcatName(capr.MaxHelmReleaseNameLength, cluster.Name, "managed", "system", "agent")
-	logrus.Infof("==== [managed-system-agent] attempt to uninstall system-agent  [%s] on %s", systemAgent, cluster.Name)
-	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-		app, err := h.bundles.Get(cluster.Status.FleetWorkspaceName, systemAgent, metav1.GetOptions{})
+			if err := h.bundles.Delete(app.Namespace, app.Name, &metav1.DeleteOptions{}); err != nil {
+				logrus.Errorf("==== [managed-system-agent] hit errors: %v", err)
+				if errors.IsNotFound(err) {
+					return nil
+				}
+				return err
+			}
+			logrus.Infof("==== [managed-system-agent] system-agent bunddles deleted")
+			return nil
+		})
 		if err != nil {
-			if errors.IsNotFound(err) {
-				logrus.Infof("==== [managed-system-agent] system agent bundle does not exist")
-				return nil
-			}
-			return err
+			return cluster, fmt.Errorf("failed to delete system-agent bundle: %v", err)
 		}
-		if err := h.bundles.Delete(app.Namespace, app.Name, &metav1.DeleteOptions{}); err != nil {
-			logrus.Errorf("==== [managed-system-agent] hit errors: %v", err)
-			if errors.IsNotFound(err) {
-				return nil
-			}
-			return err
+
+		globalCounter.Add(-1)
+		if err != nil {
+			return nil, fmt.Errorf("[k3s-based-upgrader] failed to uninstall k3s based upgrade app: %w", err)
 		}
-		logrus.Infof("==== [managed-system-agent] system-agent bunddles deleted")
-		return nil
-	})
-	if err != nil {
-		return cluster, fmt.Errorf("failed to delete system-agent bundle: %v", err)
 	}
 
 	return cluster, nil
