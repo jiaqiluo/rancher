@@ -110,6 +110,7 @@ func (h handler) onClusterChange(key string, cluster *v3.Cluster) (*v3.Cluster, 
 
 	if err := h.manager.Ensure(
 		toInstallCrdChart.ReleaseNamespace,
+		toInstallChart.ReleaseName,
 		toInstallCrdChart.ChartName,
 		toInstallCrdChartVersion,
 		"",
@@ -148,6 +149,7 @@ func (h handler) onClusterChange(key string, cluster *v3.Cluster) (*v3.Cluster, 
 
 	if err := h.manager.Ensure(
 		toInstallChart.ReleaseNamespace,
+		toInstallChart.ReleaseName,
 		toInstallChart.ChartName,
 		toInstallChartVersion,
 		"",

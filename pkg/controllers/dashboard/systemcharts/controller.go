@@ -4,11 +4,14 @@ package systemcharts
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
+	"strings"
 	"time"
 
 	catalog "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/capr"
 	"github.com/rancher/rancher/pkg/controllers/dashboard/chart"
 	"github.com/rancher/rancher/pkg/controllers/management/k3sbasedupgrade"
 	"github.com/rancher/rancher/pkg/features"
@@ -24,15 +27,17 @@ import (
 	"github.com/sirupsen/logrus"
 	k8sappsv1 "k8s.io/api/apps/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/util/retry"
 )
 
 const (
-	repoName           = "rancher-charts"
-	sucDeploymentName  = "system-upgrade-controller"
-	legacyAppLabel     = "io.cattle.field/appId"
-	legacyAppFinalizer = "systemcharts.cattle.io/legacy-k3s-based-upgrader-deprecation"
+	repoName                = "rancher-charts"
+	sucDeploymentName       = "system-upgrade-controller"
+	legacyAppLabel          = "io.cattle.field/appId"
+	legacyAppFinalizer      = "systemcharts.cattle.io/legacy-k3s-based-upgrader-deprecation"
+	mangedSucDeploymentAnno = "app.cattle.io/managed-system-upgrade-controller"
 )
 
 var (
@@ -143,7 +148,7 @@ func (h *handler) onRepo(key string, repo *catalog.ClusterRepo) (*catalog.Cluste
 		minVersion := chartDef.MinVersionSetting.Get()
 		exactVersion := chartDef.ExactVersionSetting.Get()
 		takeOwnership := chartDef.ChartName == chart.WebhookChartName || chartDef.ChartName == chart.ProvisioningCAPIChartName
-		if err := h.manager.Ensure(chartDef.ReleaseNamespace, chartDef.ChartName, minVersion, exactVersion, values, takeOwnership, installImageOverride); err != nil {
+		if err := h.manager.Ensure(chartDef.ReleaseNamespace, chartDef.ReleaseName, chartDef.ChartName, minVersion, exactVersion, values, takeOwnership, installImageOverride); err != nil {
 			return repo, err
 		}
 	}
@@ -155,6 +160,7 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 	return []*chart.Definition{
 		{
 			ReleaseNamespace:    namespace.System,
+			ReleaseName:         chart.WebhookChartName,
 			ChartName:           chart.WebhookChartName,
 			ExactVersionSetting: settings.RancherWebhookVersion,
 			Values: func() map[string]interface{} {
@@ -177,12 +183,14 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 		},
 		{
 			ReleaseNamespace: "rancher-operator-system",
+			ReleaseName:      "rancher-operator",
 			ChartName:        "rancher-operator",
 			Uninstall:        true,
 			RemoveNamespace:  true,
 		},
 		{
 			ReleaseNamespace:    namespace.ProvisioningCAPINamespace,
+			ReleaseName:         chart.ProvisioningCAPIChartName,
 			ChartName:           chart.ProvisioningCAPIChartName,
 			ExactVersionSetting: settings.RancherProvisioningCAPIVersion,
 			Values: func() map[string]interface{} {
@@ -198,7 +206,15 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 			RemoveNamespace: !features.EmbeddedClusterAPI.Enabled(),
 		},
 		{
-			ReleaseNamespace:    namespace.System,
+			ReleaseNamespace: namespace.System,
+			ReleaseName: func() string {
+				clusterName := os.Getenv("CATTLE_CLUSTER_DISPLAY_NAME")
+				if clusterName == "" {
+					return chart.SystemUpgradeControllerChartName
+				} else {
+					return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, "mcc", capr.SafeConcatName(48, clusterName, "managed", "system-upgrade-controller"))
+				}
+			}(),
 			ChartName:           chart.SystemUpgradeControllerChartName,
 			ExactVersionSetting: settings.SystemUpgradeControllerChartVersion,
 			Values: func() map[string]interface{} {
@@ -210,23 +226,22 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 				return data.MergeMaps(values, configMapValues)
 			},
 			Enabled: func() bool {
-				toEnable := false
+				toEnable := true
 				suc, err := h.deploymentCache.Get(namespace.System, sucDeploymentName)
-
-				// the absence of the deployment or the absence of the legacy label on the existing deployment indicate
-				// that the old rancher-k3s/rke2-upgrader Project App has been removed
-				if err != nil {
-					if errors.IsNotFound(err) {
-						toEnable = true
-					} else {
-						logrus.Warnf("[systemcharts] failed to get the deployment %s/%s: %s", namespace.System, sucDeploymentName, err.Error())
-					}
+				// the absence of the deployment indicates that the old rancher-k3s/rke2-upgrader Project App has been removed
+				if err != nil && !errors.IsNotFound(err) {
+					toEnable = false
+					logrus.Warnf("[systemcharts] failed to get the deployment %s/%s: %s", namespace.System, sucDeploymentName, err.Error())
 				}
 				if suc != nil {
-					if _, ok := suc.Labels[legacyAppLabel]; !ok {
-						toEnable = true
+					// the absent of the app.cattle.io/managed-system-upgrade-controller annotation indicates that
+					// the old Fleet Bundle, in the case of node-driver cluster,
+					// or the old rancher-k3s/rke2-upgrader Project App, in the case of imported cluster, the still exists
+					if _, ok := suc.Annotations[mangedSucDeploymentAnno]; !ok {
+						toEnable = false
 					}
 				}
+
 				logrus.Infof("[systemcharts] feature ManagedSystemUpgradeController = %t, toEnable = %t",
 					features.ManagedSystemUpgradeController.Enabled(), toEnable)
 
@@ -238,52 +253,79 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 
 // onDeployment enqueues the rancher-charts ClusterRepo to the controller's processing queue
 // when a specific event occurs on the target deployment. It is currently used to manage
-// the migration from the legacy k3s-based-upgrader app to the system-upgrade-controller app.
+// the migration from the legacy k3s-based-upgrader app to the system-upgrade-controller app, and
+// the migration from the fleet-manged system-upgrade-controller to the system-upgrade-controller app
 func (h *handler) onDeployment(_ string, d *k8sappsv1.Deployment) (*k8sappsv1.Deployment, error) {
-	var found bool
-	if d != nil && d.Namespace == namespace.System && d.Name == sucDeploymentName {
-		appName, ok := d.Labels[legacyAppLabel]
-		if ok {
-			if appName == k3sbasedupgrade.K3sAppName || appName == k3sbasedupgrade.Rke2AppName {
-				found = true
-			}
-		}
+	if d == nil || d.Namespace != namespace.System || d.Name != sucDeploymentName {
+		return d, nil
 	}
-	if found {
-		index := slices.Index(d.Finalizers, legacyAppFinalizer)
-		logrus.Infof("[systemcharts] found deployment %s/%s with label %s=%s, index of target finalzier = %d",
-			d.Namespace, d.Name, legacyAppLabel, d.Labels[legacyAppLabel], index)
-		d = d.DeepCopy()
+	var found bool
+	// for imported cluster
+	if appName, ok := d.Labels[legacyAppLabel]; ok && (appName == k3sbasedupgrade.K3sAppName || appName == k3sbasedupgrade.Rke2AppName) {
+		found = true
+	}
+	// for node-driver cluster
+	if value, ok := d.Annotations["meta.helm.sh/release-name"]; ok && strings.HasPrefix(value, "mcc-") {
+		found = true
+	}
+	if !found {
+		return d, nil
+	}
+
+	index := slices.Index(d.Finalizers, legacyAppFinalizer)
+	logrus.Infof("[systemcharts] found deployment %s/%s with index of target finalzier = %d", d.Namespace, d.Name, index)
+	if (d.DeletionTimestamp != nil && index == -1) || (d.DeletionTimestamp == nil && index >= 0) {
+		return d, nil
+	}
+	var err error
+	switch {
+	case d.DeletionTimestamp != nil && index >= 0:
 		// When the deployment is being deleted, remove the finalizer if it exists, and enqueue the rancher-charts clusterRepo
-		if d.DeletionTimestamp != nil {
-			if index >= 0 {
-				var finalizers []string
-				finalizers = append(finalizers, d.Finalizers[:index]...)
-				finalizers = append(finalizers, d.Finalizers[index+1:]...)
-				d.Finalizers = finalizers
-				err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-					_, err := h.deployment.Update(d)
-					return err
-				})
-				if err != nil {
-					return nil, fmt.Errorf("[systemcharts] failed to update deployment %s/%s: %w", d.Namespace, d.Name, err)
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			d, err = h.deployment.Get(d.Namespace, d.Name, metav1.GetOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					return nil
 				}
+				return err
 			}
-			logrus.Infof("[systemcharts] enqueue %s", repoName)
-			h.clusterRepo.EnqueueAfter(repoName, 2*time.Second)
-		} else {
-			// Add the finalizer if it is absent, ensuring Wrangler can detect the deletion event
+			index := slices.Index(d.Finalizers, legacyAppFinalizer)
 			if index == -1 {
-				d.Finalizers = append(d.Finalizers, legacyAppFinalizer)
-				err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-					_, err := h.deployment.Update(d)
-					return err
-				})
-				if err != nil {
-					return nil, fmt.Errorf("[systemcharts] failed to update deployment %s/%s: %w", d.Namespace, d.Name, err)
-				}
+				return nil
 			}
+			d = d.DeepCopy()
+			d.Finalizers = append(d.Finalizers[:index], d.Finalizers[index+1:]...)
+			d, err = h.deployment.Update(d)
+			return err
+		}); err != nil {
+			return nil, fmt.Errorf("failed to update deployment %s/%s: %w", d.Namespace, d.Name, err)
 		}
+		logrus.Infof("[systemcharts] enqueue %s", repoName)
+		h.clusterRepo.EnqueueAfter(repoName, 2*time.Second)
+
+	case d.DeletionTimestamp == nil && index == -1:
+		// If the deployment is not being deleted, add the finalizer if it is absent to ensure Wrangler can detect the deletion event
+		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+			d, err = h.deployment.Get(d.Namespace, d.Name, metav1.GetOptions{})
+			if err != nil {
+				if errors.IsNotFound(err) {
+					return nil
+				}
+				return err
+			}
+			index := slices.Index(d.Finalizers, legacyAppFinalizer)
+			if index >= 0 {
+				return nil
+			}
+			d = d.DeepCopy()
+			d.Finalizers = append(d.Finalizers, legacyAppFinalizer)
+			d, err = h.deployment.Update(d)
+			return err
+		}); err != nil {
+			return nil, fmt.Errorf("failed to update deployment %s/%s: %w", d.Namespace, d.Name, err)
+		}
+	default:
+		return d, nil
 	}
 	return d, nil
 }

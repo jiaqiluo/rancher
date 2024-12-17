@@ -50,6 +50,7 @@ type context struct {
 	Affinity              string
 	ResourceRequirements  string
 	ClusterRegistry       string
+	ClusterDisplayName    string
 }
 
 func toFeatureString(features map[string]bool) string {
@@ -165,6 +166,18 @@ func SystemTemplate(resp io.Writer, agentImage, authImage, namespace, token, url
 		Affinity:              agentAffinity,
 		ResourceRequirements:  agentResourceRequirements,
 		ClusterRegistry:       registryURL,
+		ClusterDisplayName: func() string {
+			// for node-driver rke2/k3s cluster
+			if cluster.Status.Driver == apimgmtv3.ClusterDriverImported &&
+				(cluster.Status.Provider == apimgmtv3.ClusterDriverRke2 || cluster.Status.Provider == apimgmtv3.ClusterDriverK3s) {
+				return cluster.Spec.DisplayName
+			}
+			// for imported rke2/k3s cluster
+			if cluster.Status.Driver == apimgmtv3.ClusterDriverRke2 || cluster.Status.Driver == apimgmtv3.ClusterDriverK3s {
+				return ""
+			}
+			return ""
+		}(),
 	}
 
 	return t.Execute(resp, context)
@@ -174,6 +187,11 @@ func GetDesiredFeatures(cluster *apimgmtv3.Cluster) map[string]bool {
 	enableMSUC := false
 	if cluster.Status.Driver == apimgmtv3.ClusterDriverRke2 || cluster.Status.Driver == apimgmtv3.ClusterDriverK3s {
 		// the case of imported rke2/k3s cluster
+		enableMSUC = true
+	}
+	// for node-driver rke2/k3s cluster
+	if cluster.Status.Driver == apimgmtv3.ClusterDriverImported &&
+		(cluster.Status.Provider == apimgmtv3.ClusterDriverRke2 || cluster.Status.Provider == apimgmtv3.ClusterDriverK3s) {
 		enableMSUC = true
 	}
 
