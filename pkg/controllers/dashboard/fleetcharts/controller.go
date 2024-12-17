@@ -78,7 +78,7 @@ func (h *handler) onSetting(key string, setting *v3.Setting) (*v3.Setting, error
 	}
 
 	h.Lock()
-	if err := h.manager.Uninstall(fleetUninstallChart.ReleaseNamespace, fleetUninstallChart.ChartName); err != nil {
+	if err := h.manager.Uninstall(fleetUninstallChart.ReleaseNamespace, fleetUninstallChart.ReleaseName); err != nil {
 		h.Unlock()
 		return nil, err
 	}
@@ -92,6 +92,7 @@ func (h *handler) onSetting(key string, setting *v3.Setting) (*v3.Setting, error
 
 	err := h.manager.Ensure(
 		fleetCRDChart.ReleaseNamespace,
+		fleetCRDChart.ReleaseName,
 		fleetCRDChart.ChartName,
 		fleetVersion,
 		"",
@@ -157,6 +158,7 @@ func (h *handler) onSetting(key string, setting *v3.Setting) (*v3.Setting, error
 	return setting,
 		h.manager.Ensure(
 			fleetChart.ReleaseNamespace,
+			fleetChart.ReleaseName,
 			fleetChart.ChartName,
 			fleetVersion,
 			"",

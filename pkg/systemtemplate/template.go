@@ -193,6 +193,8 @@ spec:
             value: "true"
           - name: CATTLE_CLUSTER_REGISTRY
             value: "{{.ClusterRegistry}}"
+          - name: CATTLE_CLUSTER_DISPLAY_NAME
+            value: "{{.ClusterDisplayName}}"
           {{- if .IsPreBootstrap }}
           # since we're on the host network, talk to the apiserver over localhost
           {{- end }}

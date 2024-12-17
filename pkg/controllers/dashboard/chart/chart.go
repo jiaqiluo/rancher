@@ -36,18 +36,19 @@ var errKeyNotFound = errors.New("key not found")
 // mockgen --build_flags=--mod=mod -destination=pkg/controllers/dashboard/chart/fake/manager.go -package=fake github.com/rancher/rancher/pkg/controllers/dashboard/chart Manager
 type Manager interface {
 	// Ensure ensures that the chart is installed into the given namespace with the given version configuration and values.
-	Ensure(namespace, name, minVersion, exactVersion string, values map[string]interface{}, takeOwnership bool, installImageOverride string) error
+	Ensure(namespace, releaseName, chartName, minVersion, exactVersion string, values map[string]interface{}, takeOwnership bool, installImageOverride string) error
 
 	// Uninstall uninstalls the given chart in the given namespace.
-	Uninstall(namespace, name string) error
+	Uninstall(namespace, releaseName string) error
 
 	// Remove removes the chart from the desired state.
-	Remove(namespace, name string)
+	Remove(namespace, releaseName string)
 }
 
 // Definition defines a helm chart.
 type Definition struct {
 	ReleaseNamespace    string
+	ReleaseName         string
 	ChartName           string
 	MinVersionSetting   settings.Setting
 	ExactVersionSetting settings.Setting
