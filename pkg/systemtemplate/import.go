@@ -31,26 +31,27 @@ var (
 )
 
 type context struct {
-	Features              string
-	CAChecksum            string
-	AgentImage            string
-	AgentEnvVars          string
-	AuthImage             string
-	TokenKey              string
-	Token                 string
-	URL                   string
-	Namespace             string
-	URLPlain              string
-	IsWindowsCluster      bool
-	IsPreBootstrap        bool
-	IsRKE                 bool
-	PrivateRegistryConfig string
-	Tolerations           string
-	AppendTolerations     string
-	Affinity              string
-	ResourceRequirements  string
-	ClusterRegistry       string
-	ClusterDisplayName    string
+	Features                  string
+	CAChecksum                string
+	AgentImage                string
+	AgentEnvVars              string
+	AuthImage                 string
+	TokenKey                  string
+	Token                     string
+	URL                       string
+	Namespace                 string
+	URLPlain                  string
+	IsWindowsCluster          bool
+	IsPreBootstrap            bool
+	IsRKE                     bool
+	PrivateRegistryConfig     string
+	Tolerations               string
+	AppendTolerations         string
+	Affinity                  string
+	ResourceRequirements      string
+	ClusterRegistry           string
+	ClusterDisplayName        string
+	ManagedSUCAppNameOverride bool
 }
 
 func toFeatureString(features map[string]bool) string {
@@ -166,17 +167,14 @@ func SystemTemplate(resp io.Writer, agentImage, authImage, namespace, token, url
 		Affinity:              agentAffinity,
 		ResourceRequirements:  agentResourceRequirements,
 		ClusterRegistry:       registryURL,
-		ClusterDisplayName: func() string {
+		ClusterDisplayName:    cluster.Spec.DisplayName,
+		ManagedSUCAppNameOverride: func() bool {
 			// for node-driver rke2/k3s cluster
 			if cluster.Status.Driver == apimgmtv3.ClusterDriverImported &&
 				(cluster.Status.Provider == apimgmtv3.ClusterDriverRke2 || cluster.Status.Provider == apimgmtv3.ClusterDriverK3s) {
-				return cluster.Spec.DisplayName
+				return true
 			}
-			// for imported rke2/k3s cluster
-			if cluster.Status.Driver == apimgmtv3.ClusterDriverRke2 || cluster.Status.Driver == apimgmtv3.ClusterDriverK3s {
-				return ""
-			}
-			return ""
+			return false
 		}(),
 	}
 
@@ -185,11 +183,11 @@ func SystemTemplate(resp io.Writer, agentImage, authImage, namespace, token, url
 
 func GetDesiredFeatures(cluster *apimgmtv3.Cluster) map[string]bool {
 	enableMSUC := false
+	// the case of imported rke2/k3s cluster
 	if cluster.Status.Driver == apimgmtv3.ClusterDriverRke2 || cluster.Status.Driver == apimgmtv3.ClusterDriverK3s {
-		// the case of imported rke2/k3s cluster
 		enableMSUC = true
 	}
-	// for node-driver rke2/k3s cluster
+	// the case of node-driver rke2/k3s cluster
 	if cluster.Status.Driver == apimgmtv3.ClusterDriverImported &&
 		(cluster.Status.Provider == apimgmtv3.ClusterDriverRke2 || cluster.Status.Provider == apimgmtv3.ClusterDriverK3s) {
 		enableMSUC = true

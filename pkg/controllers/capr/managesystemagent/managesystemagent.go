@@ -395,6 +395,9 @@ func (h *handler) OnChangeUninstallFleetBasedApps(_ string, cluster *rancherv1.C
 	if cluster.Status.FleetWorkspaceName == "" {
 		return cluster, nil
 	}
+	if !cluster.Status.Ready {
+		return cluster, nil
+	}
 
 	if globalCounter.Load() < int32(settings.K3sBasedUpgraderUninstallConcurrency.GetInt()) {
 		globalCounter.Add(1)
@@ -465,6 +468,9 @@ func (h *handler) OnChangeInstallSystemAgent(_ string, cluster *rancherv1.Cluste
 		return cluster, nil
 	}
 	if cluster.Spec.RKEConfig == nil || settings.SystemAgentUpgradeImage.Get() == "" {
+		return cluster, nil
+	}
+	if !cluster.Status.Ready {
 		return cluster, nil
 	}
 

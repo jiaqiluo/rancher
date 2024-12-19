@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"slices"
-	"strings"
 	"time"
 
 	catalog "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
@@ -208,12 +207,15 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 		{
 			ReleaseNamespace: namespace.System,
 			ReleaseName: func() string {
-				clusterName := os.Getenv("CATTLE_CLUSTER_DISPLAY_NAME")
-				if clusterName == "" {
-					return chart.SystemUpgradeControllerChartName
-				} else {
-					return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, "mcc", capr.SafeConcatName(48, clusterName, "managed", "system-upgrade-controller"))
+				if os.Getenv("CATTLE_MANAGED_SUC_APP_NAME_OVERRIDE") == "true" {
+					clusterName := os.Getenv("CATTLE_CLUSTER_DISPLAY_NAME")
+					if clusterName != "" {
+						return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, "mcc",
+							capr.SafeConcatName(48, clusterName, "managed", "system-upgrade-controller"))
+					}
+					logrus.Warnf("CATTLE_CLUSTER_DISPLAY_NAME is empty while CATTLE_MANAGED_SUC_APP_NAME_OVERRIDE is true, using the default app name")
 				}
+				return chart.SystemUpgradeControllerChartName
 			}(),
 			ChartName:           chart.SystemUpgradeControllerChartName,
 			ExactVersionSetting: settings.SystemUpgradeControllerChartVersion,
@@ -265,7 +267,7 @@ func (h *handler) onDeployment(_ string, d *k8sappsv1.Deployment) (*k8sappsv1.De
 		found = true
 	}
 	// for node-driver cluster
-	if value, ok := d.Annotations["meta.helm.sh/release-name"]; ok && strings.HasPrefix(value, "mcc-") {
+	if _, ok := d.Annotations[mangedSucDeploymentAnno]; !ok {
 		found = true
 	}
 	if !found {

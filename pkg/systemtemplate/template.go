@@ -195,6 +195,8 @@ spec:
             value: "{{.ClusterRegistry}}"
           - name: CATTLE_CLUSTER_DISPLAY_NAME
             value: "{{.ClusterDisplayName}}"
+          - name: CATTLE_MANAGED_SUC_APP_NAME_OVERRIDE
+            value: "{{.ManagedSUCAppNameOverride}}"
           {{- if .IsPreBootstrap }}
           # since we're on the host network, talk to the apiserver over localhost
           {{- end }}
