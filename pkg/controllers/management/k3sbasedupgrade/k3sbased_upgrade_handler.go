@@ -5,6 +5,7 @@ import (
 
 	mgmtv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/nodesyncer"
+	"github.com/rancher/rancher/pkg/features"
 	planv1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/labels"
@@ -44,6 +45,19 @@ func (h *handler) onClusterChange(_ string, cluster *mgmtv3.Cluster) (*mgmtv3.Cl
 		strategy = cluster.Spec.Rke2Config.ClusterUpgradeStrategy
 	} else {
 		return cluster, nil
+	}
+
+	// delete existing plan and skip upgrade if the special annotation is found on the cluster
+	// if value, ok := cluster.Annotations["management.cattle.io/disable-cluster-version-management"]; ok && value == "true" {
+	// 	return cluster, h.removePlans(cluster)
+	// }
+
+	// the value on the cluster take precedence over the global setting
+	if cluster.Spec.EnableClusterVersionManagement != nil && !*cluster.Spec.EnableClusterVersionManagement {
+		return cluster, h.removePlans(cluster)
+	}
+	if cluster.Spec.EnableClusterVersionManagement == nil && !features.ImportedClusterVersionManagement.Enabled() {
+		return cluster, h.removePlans(cluster)
 	}
 
 	// no version set on imported cluster
