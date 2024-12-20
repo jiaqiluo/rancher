@@ -103,10 +103,6 @@ func (h *handler) onRepo(key string, repo *catalog.ClusterRepo) (*catalog.Cluste
 		systemGlobalRegistry["cattle"] = registryMap
 	}
 	for _, chartDef := range h.getChartsToInstall() {
-		if chartDef.Enabled != nil && !chartDef.Enabled() {
-			continue
-		}
-
 		if chartDef.Uninstall {
 			if err := h.manager.Uninstall(chartDef.ReleaseNamespace, chartDef.ChartName); err != nil {
 				return repo, err
@@ -116,6 +112,9 @@ func (h *handler) onRepo(key string, repo *catalog.ClusterRepo) (*catalog.Cluste
 					return repo, err
 				}
 			}
+			continue
+		}
+		if chartDef.Enabled != nil && !chartDef.Enabled() {
 			continue
 		}
 
@@ -233,6 +232,7 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 
 				return features.ManagedSystemUpgradeController.Enabled() && toEnable
 			},
+			Uninstall: !features.ManagedSystemUpgradeController.Enabled(),
 		},
 	}
 }

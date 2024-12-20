@@ -175,6 +175,12 @@ func GetDesiredFeatures(cluster *apimgmtv3.Cluster) map[string]bool {
 	if cluster.Status.Driver == apimgmtv3.ClusterDriverRke2 || cluster.Status.Driver == apimgmtv3.ClusterDriverK3s {
 		// the case of imported rke2/k3s cluster
 		enableMSUC = true
+		// the value on the cluster take precedence over the global setting
+		if cluster.Spec.EnableClusterVersionManagement != nil {
+			enableMSUC = *cluster.Spec.EnableClusterVersionManagement
+		} else {
+			enableMSUC = features.ImportedClusterVersionManagement.Enabled()
+		}
 	}
 
 	return map[string]bool{

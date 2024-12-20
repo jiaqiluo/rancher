@@ -316,6 +316,7 @@ func (h *handler) createNewCluster(cluster *v1.Cluster, status v1.ClusterStatus,
 	spec.DefaultPodSecurityAdmissionConfigurationTemplateName = cluster.Spec.DefaultPodSecurityAdmissionConfigurationTemplateName
 	spec.DefaultClusterRoleForProjectMembers = cluster.Spec.DefaultClusterRoleForProjectMembers
 	spec.EnableNetworkPolicy = cluster.Spec.EnableNetworkPolicy
+	spec.EnableClusterVersionManagement = cluster.Spec.EnableClusterVersionManagement
 	spec.DesiredAgentImage = image.ResolveWithCluster(settings.AgentImage.Get(), cluster)
 	spec.DesiredAuthImage = image.ResolveWithCluster(settings.AuthImage.Get(), cluster)
 

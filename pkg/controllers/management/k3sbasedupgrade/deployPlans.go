@@ -14,10 +14,43 @@ import (
 	"github.com/rancher/rancher/pkg/settings"
 	planv1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const MaxDisplayNodes = 10
+
+func (h *handler) removePlans(cluster *mgmtv3.Cluster) error {
+	// access downstream cluster
+	clusterCtx, err := h.manager.UserContextNoControllers(cluster.Name)
+	if err != nil {
+		return err
+	}
+	// create a client for GETing Plans in the downstream cluster
+	planConfig, err := planClientset.NewForConfig(&clusterCtx.RESTConfig)
+	if err != nil {
+		return err
+	}
+	planClient := planConfig.Plans(systemUpgradeNS)
+	planList, err := planClient.List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+	for _, plan := range planList.Items {
+		switch plan.Name {
+		case k3sMasterPlanName, k3sWorkerPlanName, rke2MasterPlanName, rke2WorkerPlanName:
+			if err := planClient.Delete(context.TODO(), plan.Name, metav1.DeleteOptions{}); err != nil {
+				if !errors.IsNotFound(err) {
+					return nil
+				}
+				return err
+			}
+		default:
+			return nil
+		}
+	}
+	return nil
+}
 
 // deployPlans creates a master and worker plan in the downstream cluster to instrument
 // the system-upgrade-controller in the downstream cluster
