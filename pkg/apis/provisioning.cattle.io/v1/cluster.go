@@ -30,6 +30,7 @@ type ClusterSpec struct {
 	ClusterAgentDeploymentCustomization                  *AgentDeploymentCustomization `json:"clusterAgentDeploymentCustomization,omitempty"`
 	DefaultPodSecurityAdmissionConfigurationTemplateName string                        `json:"defaultPodSecurityAdmissionConfigurationTemplateName,omitempty"`
 	DefaultClusterRoleForProjectMembers                  string                        `json:"defaultClusterRoleForProjectMembers,omitempty" norman:"type=reference[roleTemplate]"`
+	EnableClusterVersionManagement                       *bool                         `json:"enableClusterVersionManagement,omitempty"`
 	EnableNetworkPolicy                                  *bool                         `json:"enableNetworkPolicy,omitempty" norman:"default=false"`
 	FleetAgentDeploymentCustomization                    *AgentDeploymentCustomization `json:"fleetAgentDeploymentCustomization,omitempty"`
 
