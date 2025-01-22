@@ -65,6 +65,12 @@ var (
 		true,
 		false,
 		false)
+	ImportedClusterVersionManagement = newFeature(
+		"imported-cluster-version-management",
+		"Enable the version management on imported RKE2/K3s cluster",
+		true,
+		true,
+		true)
 	ManagedSystemUpgradeController = newFeature(
 		"managed-system-upgrade-controller",
 		"Enable the installation of the system-upgrade-controller app as a managed system chart",
