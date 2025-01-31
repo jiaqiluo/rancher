@@ -76,10 +76,11 @@ type ContentClient interface {
 }
 
 type Manager struct {
-	ctx                   context.Context
-	operation             OperationClient
-	content               ContentClient
-	pods                  corecontrollers.PodClient
+	ctx       context.Context
+	operation OperationClient
+	content   ContentClient
+	pods      corecontrollers.PodClient
+	// todo: add a lock to avoid racing
 	desiredCharts         map[desiredKey]map[string]interface{}
 	sync                  chan desired
 	refreshIntervalChange chan struct{}
@@ -156,10 +157,13 @@ func (m *Manager) runSync() {
 		case <-m.ctx.Done():
 			return
 		case <-m.trigger:
+			logrus.Info("==== runSync m.trigger")
 			_ = m.installCharts(m.desiredCharts, true)
 		case <-t.C:
+			logrus.Info("==== runSync t.C")
 			_ = m.installCharts(m.desiredCharts, true)
 		case desired := <-m.sync:
+			logrus.Infof("==== runSync m.sync key %s", desired.key)
 			v, exists := m.desiredCharts[desired.key]
 			// newly requested or changed
 			if !exists || !equality.Semantic.DeepEqual(v, desired.values) {
@@ -191,6 +195,7 @@ func (m *Manager) installCharts(charts map[desiredKey]map[string]interface{}, ta
 	var errs []error
 
 	for key, values := range charts {
+		logrus.Infof("==== installCharts receive %s", key.name)
 		for {
 			if err := m.install(key.namespace, key.name, key.minVersion, key.exactVersion, values, takeOwnership, key.installImageOverride); err == repo.ErrNoChartName || apierrors.IsNotFound(err) {
 				logrus.Errorf("Failed to find system chart %s will try again in 5 seconds: %v", key.name, err)
@@ -254,6 +259,7 @@ func (m *Manager) Ensure(namespace, name, minVersion, exactVersion string, value
 func (m *Manager) Remove(namespace, name string) {
 	for k := range m.desiredCharts {
 		if k.namespace == namespace && k.name == name {
+			logrus.Infof("==== Removing from desire chart: %s", k)
 			delete(m.desiredCharts, k)
 		}
 	}

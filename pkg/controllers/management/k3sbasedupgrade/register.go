@@ -24,7 +24,7 @@ type handler struct {
 
 const (
 	systemUpgradeNS        = "cattle-system"
-	rancherManagedPlan     = "rancher-managed"
+	RancherManagedPlan     = "rancher-managed"
 	upgradeDisableLabelKey = "upgrade.cattle.io/disable"
 )
 

@@ -1,12 +1,16 @@
 package k3sbasedupgrade
 
 import (
-	"sync/atomic"
+	"context"
 
 	mgmtv3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/nodesyncer"
+	"github.com/rancher/rancher/pkg/features"
+	planClientset "github.com/rancher/rancher/pkg/generated/clientset/versioned/typed/upgrade.cattle.io/v1"
 	planv1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
 	"github.com/sirupsen/logrus"
+	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
@@ -15,13 +19,63 @@ const (
 	Rke2AppName = "rancher-rke2-upgrader"
 )
 
-// globalCounter keeps track of the number of clusters for which the handler is concurrently uninstalling the legacy K3s-based upgrade app.
-// An atomic integer is used for efficiency, as it is lighter than a traditional lock.
-var globalCounter atomic.Int32
-
 func (h *handler) onClusterChange(_ string, cluster *mgmtv3.Cluster) (*mgmtv3.Cluster, error) {
 	if cluster == nil || cluster.DeletionTimestamp != nil {
 		return nil, nil
+	}
+	// only applies to imported k3s/rke2 clusters
+	if cluster.Status.Driver != mgmtv3.ClusterDriverK3s && cluster.Status.Driver != mgmtv3.ClusterDriverRke2 {
+		return cluster, nil
+	}
+
+	if !versionManagementEnabled(cluster) {
+		logrus.Infof("====== k3sbased upgrade controller - vesion managed is disabled in cluster %s =====", cluster.Name)
+		var masterPlan, workerPlan planv1.Plan
+		clusterCtx, err := h.manager.UserContextNoControllers(cluster.Name)
+		if err != nil {
+			return cluster, err
+		}
+		planConfig, err := planClientset.NewForConfig(&clusterCtx.RESTConfig)
+		if err != nil {
+			return cluster, err
+		}
+		planClient := planConfig.Plans(systemUpgradeNS)
+		planList, err := planClient.List(context.TODO(), metav1.ListOptions{})
+		if err != nil {
+			return cluster, err
+		}
+		for _, plan := range planList.Items {
+			switch plan.Name {
+			case k3sMasterPlanName, rke2MasterPlanName:
+				masterPlan = plan
+			case k3sWorkerPlanName, rke2WorkerPlanName:
+				workerPlan = plan
+			}
+		}
+		// remove rancher-managed plans if the cluster is not in the middle of version upgrade
+		if mgmtv3.ClusterConditionUpgraded.IsTrue(cluster) {
+			logrus.Debug("[k3s-based-upgrader] version management is disabled, removing rancher-managed plans if there is any")
+			if masterPlan.Name != "" {
+				logrus.Infof("====== k3sbased upgrade controller - removing master plan %s =====", masterPlan.Name)
+				if err := planClient.Delete(context.TODO(), masterPlan.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+					return cluster, err
+				}
+			}
+			if workerPlan.Name != "" {
+				logrus.Infof("====== k3sbased upgrade controller - removing worker plan %s =====", workerPlan.Name)
+				if err := planClient.Delete(context.TODO(), workerPlan.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
+					return cluster, err
+				}
+			}
+			return cluster, nil
+		}
+
+		// set cluster upgrading status
+		cluster, err = h.modifyClusterCondition(cluster, masterPlan, workerPlan, mgmtv3.ClusterUpgradeStrategy{})
+		if err != nil {
+			return cluster, err
+		}
+		return cluster, nil
 	}
 
 	var (
@@ -67,8 +121,7 @@ func (h *handler) onClusterChange(_ string, cluster *mgmtv3.Cluster) (*mgmtv3.Cl
 			if mgmtv3.ClusterConditionUpgraded.IsUnknown(cluster) {
 				logrus.Debug("[k3s-based-upgrader] updating the Upgraded condition to true")
 				cluster = cluster.DeepCopy()
-				mgmtv3.ClusterConditionUpgraded.True(cluster)
-				mgmtv3.ClusterConditionUpgraded.Message(cluster, "")
+				cluster = upgradeDone(cluster)
 				if cluster, err = h.clusterClient.Update(cluster); err != nil {
 					return nil, err
 				}
@@ -78,6 +131,7 @@ func (h *handler) onClusterChange(_ string, cluster *mgmtv3.Cluster) (*mgmtv3.Cl
 		}
 	}
 
+	// Reaching this point indicates that an upgrade is required.
 	if mgmtv3.ClusterConditionUpgraded.IsTrue(cluster) {
 		logrus.Infof("[k3s-based-upgrader] upgrading cluster [%s] version from [%s] to [%s]",
 			cluster.Name, cluster.Status.Version.GitVersion, updateVersion)
@@ -122,4 +176,19 @@ func (h *handler) nodesNeedUpgrade(cluster *mgmtv3.Cluster, version string) (boo
 		}
 	}
 	return false, nil
+}
+
+// versionManagementEnabled checks if version management is enabled for a given cluster
+func versionManagementEnabled(cluster *mgmtv3.Cluster) bool {
+	if cluster == nil {
+		return false
+	}
+	switch cluster.Annotations[features.ClusterVersionManagementAnno] {
+	case "true":
+		return true
+	case "false":
+		return false
+	default:
+		return features.ImportedClusterVersionManagement.Enabled()
+	}
 }

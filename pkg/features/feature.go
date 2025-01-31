@@ -12,6 +12,16 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
+const (
+	// ClusterVersionManagementAnno indicates whether the version management is enabled for a cluster.
+	// It defines the cluster-level behavior and takes precedence over the 'imported-cluster-version-management' feature flag.
+	// If the annotation is absent on the cluster object, the 'imported-cluster-version-management' feature flag will be used.
+	// It is only recognized on imported RKE2/K3s clusters and the local cluster if it is an RKE2/k3s cluster.
+	// It will be ignored if found on a v3 cluster for other types of clusters.
+	// Expected values: "true" or "false" (type: string)
+	ClusterVersionManagementAnno = "rancher.io/enable-version-management"
+)
+
 var (
 	features = make(map[string]*Feature)
 
@@ -67,7 +77,7 @@ var (
 		false)
 	ImportedClusterVersionManagement = newFeature(
 		"imported-cluster-version-management",
-		"Enable the version management on imported RKE2/K3s cluster",
+		"Enable the version management on imported RKE2/K3s cluster, as well as the local cluster if it is an RKE2/K3s cluster",
 		true,
 		true,
 		true)
