@@ -384,7 +384,6 @@ func (h *handler) onPlan(_ string, plan *upgradev1.Plan) (*upgradev1.Plan, error
 		return plan, nil
 	}
 	index := slices.Index(plan.Finalizers, managedPlanFinalizer)
-	logrus.Infof("[managedplans] found plan %s/%s, index of target finalzier = %d", plan.Namespace, plan.Name, index)
 	if (plan.DeletionTimestamp != nil && index == -1) || (plan.DeletionTimestamp == nil && index >= 0) {
 		return plan, nil
 	}
@@ -400,10 +399,15 @@ func (h *handler) onPlan(_ string, plan *upgradev1.Plan) (*upgradev1.Plan, error
 				}
 				return err
 			}
+			if plan == nil {
+				return nil
+			}
 			index := slices.Index(plan.Finalizers, managedPlanFinalizer)
 			if index == -1 {
 				return nil
 			}
+
+			logrus.Infof("[managedplans] adding finalizer to plan %s/%s", plan.Namespace, plan.Name)
 			plan = plan.DeepCopy()
 			plan.Finalizers = append(plan.Finalizers[:index], plan.Finalizers[index+1:]...)
 			plan, err = h.plan.Update(plan)
@@ -411,6 +415,7 @@ func (h *handler) onPlan(_ string, plan *upgradev1.Plan) (*upgradev1.Plan, error
 		}); err != nil {
 			return nil, fmt.Errorf("failed to update plan %s/%s: %w", plan.Namespace, plan.Name, err)
 		}
+
 		logrus.Infof("[managedplans] enqueue %s", repoName)
 		h.clusterRepo.EnqueueAfter(repoName, 2*time.Second)
 
@@ -424,10 +429,15 @@ func (h *handler) onPlan(_ string, plan *upgradev1.Plan) (*upgradev1.Plan, error
 				}
 				return err
 			}
+			if plan == nil {
+				return nil
+			}
 			index := slices.Index(plan.Finalizers, managedPlanFinalizer)
 			if index >= 0 {
 				return nil
 			}
+
+			logrus.Infof("[managedplans] removing finalizer to plan %s/%s", plan.Namespace, plan.Name)
 			plan = plan.DeepCopy()
 			plan.Finalizers = append(plan.Finalizers, managedPlanFinalizer)
 			plan, err = h.plan.Update(plan)
@@ -461,6 +471,9 @@ func (h *handler) getChartValues(chartName string) map[string]interface{} {
 }
 
 func (h *handler) onCluster(_ string, obj *v3.Cluster) (*v3.Cluster, error) {
+	if !features.MCM.Enabled() {
+		return obj, nil
+	}
 	if obj == nil || obj.DeletionTimestamp != nil || obj.Name != "local" {
 		return obj, nil
 	}
