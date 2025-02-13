@@ -2,7 +2,6 @@ package features
 
 import (
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 
@@ -66,12 +65,6 @@ var (
 		true,
 		false,
 		false)
-	ImportedClusterVersionManagement = newFeature(
-		"imported-cluster-version-management",
-		"Enable the version management on imported RKE2/K3s cluster, and the local cluster if it is an RKE2/K3s cluster",
-		true,
-		true,
-		true)
 	ManagedSystemUpgradeController = newFeature(
 		"managed-system-upgrade-controller",
 		"Enable the installation of the system-upgrade-controller app as a managed system chart",
@@ -178,10 +171,6 @@ func InitializeFeatures(featuresClient managementv3.FeatureClient, featureArgs s
 	// applies any default values assigned in --features flag to feature map
 	if err := applyArgumentDefaults(featureArgs); err != nil {
 		logrus.Errorf("failed to apply feature args: %v", err)
-	}
-	// Remove the imported-cluster-version-management feature as it is not meaningful in the downstream cluster
-	if os.Getenv("CATTLE_CLUSTER") == "true" {
-		ImportedClusterVersionManagement.Disable()
 	}
 
 	if featuresClient == nil {
