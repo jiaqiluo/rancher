@@ -24,14 +24,14 @@ const (
 
 func (h *handler) onClusterChange(_ string, cluster *mgmtv3.Cluster) (*mgmtv3.Cluster, error) {
 	if cluster == nil || cluster.DeletionTimestamp != nil {
-		return nil, nil
+		return cluster, nil
 	}
 	// only applies to imported RKE2/K3s cluster, as well as the local cluster if it is an RKE2/K3s cluster
 	if cluster.Status.Driver != mgmtv3.ClusterDriverK3s && cluster.Status.Driver != mgmtv3.ClusterDriverRke2 {
 		return cluster, nil
 	}
 
-	if !importedclusterversionmanagement.VersionManagementEnabled(cluster) {
+	if !importedclusterversionmanagement.Enabled(cluster) {
 		// todo: remove the logging message
 		logrus.Infof("[k3s-based-upgrader] vesion management disbaled in cluster %s ", cluster.Name)
 		var masterPlan, workerPlan planv1.Plan

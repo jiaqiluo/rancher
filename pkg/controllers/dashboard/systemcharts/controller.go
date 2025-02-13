@@ -291,11 +291,11 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 						logrus.Warnf("[systemcharts] failed to get the local cluster: %v", err)
 					}
 					if cluster != nil && (cluster.Status.Driver == v3.ClusterDriverRke2 || cluster.Status.Driver == v3.ClusterDriverK3s) {
-						versionManagementEnabled = importedclusterversionmanagement.VersionManagementEnabled(cluster)
+						versionManagementEnabled = importedclusterversionmanagement.Enabled(cluster)
 					}
 				}
 				toUninstall := !versionManagementEnabled && noManagedPlan
-				logrus.Debugf("[systemcharts] uninstall system-upgrade-controlle: %t (!versionManagementEnabled: %t && noManagedPlan: %t)",
+				logrus.Debugf("[systemcharts] uninstall system-upgrade-controller: %t (!versionManagementEnabled: %t && noManagedPlan: %t)",
 					toUninstall, !versionManagementEnabled, noManagedPlan)
 				return toUninstall
 			}(),

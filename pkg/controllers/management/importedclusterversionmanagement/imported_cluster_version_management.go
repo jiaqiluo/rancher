@@ -8,15 +8,15 @@ import (
 const (
 	// VersionManagementAnno indicates whether the version management is enabled for a cluster.
 	// It defines the cluster-level behavior and takes precedence over the 'imported-cluster-version-management' setting.
-	// If absent on the cluster object, the value of the 'imported-cluster-version-management' feature will be used.
+	// If its value is system-default, the value of the 'imported-cluster-version-management' setting will be used.
 	// It is only recognized on imported RKE2/K3s clusters and the local cluster if it is an RKE2/k3s cluster.
 	// It is ignored if found on a mgmt v3 cluster for other types of clusters.
 	// Expected values: "true", "false", or "system-default" (type: string)
 	VersionManagementAnno = "rancher.io/imported-cluster-version-management"
 )
 
-// VersionManagementEnabled checks if version management is enabled for a given cluster
-func VersionManagementEnabled(cluster *mgmtv3.Cluster) bool {
+// Enabled checks if version management is enabled for a given cluster
+func Enabled(cluster *mgmtv3.Cluster) bool {
 	if cluster == nil {
 		return false
 	}
