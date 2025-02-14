@@ -69,13 +69,13 @@ func (h *handler) onClusterChange(_ string, cluster *mgmtv3.Cluster) (*mgmtv3.Cl
 		// otherwise, update the cluster condition to reflect the upgrading progress
 		if mgmtv3.ClusterConditionUpgraded.IsTrue(cluster) {
 			if masterPlan.Name != "" {
-				logrus.Debug("[k3s-based-upgrader] removing master plan %s from cluster %s", masterPlan.Name, cluster.Name)
+				logrus.Debugf("[k3s-based-upgrader] removing master plan %s from cluster %s", masterPlan.Name, cluster.Name)
 				if err := planClient.Delete(context.TODO(), masterPlan.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
 					return cluster, err
 				}
 			}
 			if workerPlan.Name != "" {
-				logrus.Debug("[k3s-based-upgrader] removing worker plan %s from cluster %", workerPlan.Name, cluster.Name)
+				logrus.Debugf("[k3s-based-upgrader] removing worker plan %s from cluster %s", workerPlan.Name, cluster.Name)
 				if err := planClient.Delete(context.TODO(), workerPlan.Name, metav1.DeleteOptions{}); err != nil && !errors.IsNotFound(err) {
 					return cluster, err
 				}

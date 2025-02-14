@@ -257,15 +257,32 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 						toEnable = true
 					}
 				}
-				toInstall := features.ManagedSystemUpgradeController.Enabled() && toEnable
-				logrus.Debugf("[systemcharts] install system-upgrade-controller: %t (ManagedSystemUpgradeController: %t && toEnable: %t)",
-					toInstall, features.ManagedSystemUpgradeController.Enabled(), toEnable)
+				var versionManagementEnabled bool
+				if features.MCMAgent.Enabled() {
+					// For the imported RKE2/K3s cluster,
+					// cluster agent checks the ManagedSystemUpgradeController feature in the imported cluster
+					versionManagementEnabled = features.ManagedSystemUpgradeController.Enabled()
+				}
+				if features.MCM.Enabled() {
+					// for the local cluster,
+					// Rancher has direct access to the mgmt v3 cluster and the ImportedClusterVersionManagement setting
+					cluster, err := h.cluster.Get("local", metav1.GetOptions{})
+					if err != nil {
+						logrus.Warnf("[systemcharts] failed to get the local cluster: %v", err)
+					}
+					if cluster != nil && (cluster.Status.Driver == v3.ClusterDriverRke2 || cluster.Status.Driver == v3.ClusterDriverK3s) {
+						versionManagementEnabled = importedclusterversionmanagement.Enabled(cluster)
+					}
+				}
+				toInstall := versionManagementEnabled && toEnable
+				logrus.Debugf("[systemcharts] install system-upgrade-controller: %t (versionManagementEnabled: %t && toEnable: %t)",
+					toInstall, versionManagementEnabled, toEnable)
 				return toInstall
 			},
 			Uninstall: func() bool {
+				noManagedPlan := false
 				// The absence of rancher-managed plans indicates the cluster is ready for uninstalling the app.
 				// The removal of the plans is handled in the k3sbasedupgrade package.
-				noManagedPlan := false
 				set := labels.Set(map[string]string{k3sbasedupgrade.RancherManagedPlan: "true"})
 				plans, err := h.plan.Cache().List(namespace.System, set.AsSelector())
 				if err != nil {
@@ -278,14 +295,12 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 				var versionManagementEnabled bool
 				if features.MCMAgent.Enabled() {
 					// For the imported RKE2/K3s cluster,
-					// the ManagedSystemUpgradeController feature is configured during the installation or update
-					// of the cluster agent to indicate the activation of the version management feature within the cluster.
-					// This logic runs in the cluster agent.
+					// cluster agent checks the ManagedSystemUpgradeController feature in the imported cluster
 					versionManagementEnabled = features.ManagedSystemUpgradeController.Enabled()
 				}
 				if features.MCM.Enabled() {
-					// for a local cluster,
-					// Rancher has direct access to the mgmt v3 cluster and the ImportedClusterVersionManagement feature
+					// for the local cluster,
+					// Rancher has direct access to the mgmt v3 cluster and the ImportedClusterVersionManagement setting
 					cluster, err := h.cluster.Get("local", metav1.GetOptions{})
 					if err != nil {
 						logrus.Warnf("[systemcharts] failed to get the local cluster: %v", err)
@@ -384,61 +399,45 @@ func (h *handler) onPlan(_ string, plan *upgradev1.Plan) (*upgradev1.Plan, error
 		return plan, nil
 	}
 	var err error
-	switch {
-	case plan.DeletionTimestamp != nil && index >= 0:
+	if plan.DeletionTimestamp != nil && index >= 0 {
 		// When the plan is being deleted, remove the finalizer if it exists, and enqueue the rancher-charts clusterRepo
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			plan, err = h.plan.Get(plan.Namespace, plan.Name, metav1.GetOptions{})
-			if err != nil {
-				if errors.IsNotFound(err) {
-					return nil
-				}
-				return err
-			}
-			if plan == nil {
-				return nil
-			}
-			index := slices.Index(plan.Finalizers, managedPlanFinalizer)
-			if index == -1 {
-				return nil
-			}
-			plan = plan.DeepCopy()
-			plan.Finalizers = append(plan.Finalizers[:index], plan.Finalizers[index+1:]...)
-			plan, err = h.plan.Update(plan)
-			return err
-		}); err != nil {
-			return nil, fmt.Errorf("failed to update plan %s/%s: %w", plan.Namespace, plan.Name, err)
+		plan, err = h.plan.Get(plan.Namespace, plan.Name, metav1.GetOptions{})
+		if err != nil && !errors.IsNotFound(err) {
+			return nil, err
 		}
-
+		if plan == nil {
+			return plan, nil
+		}
+		if index = slices.Index(plan.Finalizers, managedPlanFinalizer); index == -1 {
+			return plan, nil
+		}
+		plan = plan.DeepCopy()
+		plan.Finalizers = append(plan.Finalizers[:index], plan.Finalizers[index+1:]...)
+		plan, err = h.plan.Update(plan)
+		if err != nil {
+			return nil, err
+		}
 		logrus.Infof("[systemcharts] enqueue %s", repoName)
 		h.clusterRepo.EnqueueAfter(repoName, 2*time.Second)
-
-	case plan.DeletionTimestamp == nil && index == -1:
+	}
+	if plan.DeletionTimestamp == nil && index == -1 {
 		// If the plan is not being deleted, add the finalizer if it is absent to ensure Wrangler can detect the deletion event
-		if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			plan, err = h.plan.Get(plan.Namespace, plan.Name, metav1.GetOptions{})
-			if err != nil {
-				if errors.IsNotFound(err) {
-					return nil
-				}
-				return err
-			}
-			if plan == nil {
-				return nil
-			}
-			index := slices.Index(plan.Finalizers, managedPlanFinalizer)
-			if index >= 0 {
-				return nil
-			}
-			plan = plan.DeepCopy()
-			plan.Finalizers = append(plan.Finalizers, managedPlanFinalizer)
-			plan, err = h.plan.Update(plan)
-			return err
-		}); err != nil {
-			return nil, fmt.Errorf("failed to update plan %s/%s: %w", plan.Namespace, plan.Name, err)
+		plan, err = h.plan.Get(plan.Namespace, plan.Name, metav1.GetOptions{})
+		if err != nil && !errors.IsNotFound(err) {
+			return nil, err
 		}
-	default:
-		return plan, nil
+		if plan == nil {
+			return plan, nil
+		}
+		if index = slices.Index(plan.Finalizers, managedPlanFinalizer); index >= 0 {
+			return plan, nil
+		}
+		plan = plan.DeepCopy()
+		plan.Finalizers = append(plan.Finalizers, managedPlanFinalizer)
+		plan, err = h.plan.Update(plan)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return plan, nil
 }
