@@ -248,6 +248,11 @@ func GetDesiredFeatures(cluster *apimgmtv3.Cluster) map[string]bool {
 		// the case of imported rke2/k3s cluster
 		enableMSUC = importedclusterversionmanagement.Enabled(cluster)
 	}
+	// for node-driver rke2/k3s cluster
+	if cluster.Status.Driver == apimgmtv3.ClusterDriverImported &&
+		(cluster.Status.Provider == apimgmtv3.ClusterDriverRke2 || cluster.Status.Provider == apimgmtv3.ClusterDriverK3s) {
+		enableMSUC = true
+	}
 
 	return map[string]bool{
 		features.MCM.Name():                            false,
