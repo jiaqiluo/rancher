@@ -4,13 +4,12 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/Masterminds/semver/v3"
-	"github.com/rancher/fleet/pkg/apis/fleet.cattle.io/v1alpha1"
 	rancherv1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
 	"github.com/rancher/rancher/pkg/capr"
 	fleetconst "github.com/rancher/rancher/pkg/fleet"
@@ -24,15 +23,15 @@ import (
 	"github.com/rancher/rancher/pkg/systemtemplate"
 	"github.com/rancher/rancher/pkg/wrangler"
 	upgradev1 "github.com/rancher/system-upgrade-controller/pkg/apis/upgrade.cattle.io/v1"
-	"github.com/rancher/wrangler/v3/pkg/generic"
-	"github.com/rancher/wrangler/v3/pkg/gvk"
-	"github.com/rancher/wrangler/v3/pkg/name"
+	"github.com/rancher/wrangler/v3/pkg/apply"
+	corev1controllers "github.com/rancher/wrangler/v3/pkg/generated/controllers/core/v1"
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
-	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/clientcmd"
 )
 
 const (
@@ -58,13 +57,19 @@ var (
 		28: semver.MustParse("v1.28.13"),
 		27: semver.MustParse("v1.27.16"),
 	}
+
+	// globalCounter keeps track of the number of clusters for which the handler is concurrently uninstalling the Fleet-based app.
+	// An atomic integer is used for efficiency, as it is lighter than a traditional lock.
+	globalCounter atomic.Int32
 )
 
 type handler struct {
 	clusterRegistrationTokens v3.ClusterRegistrationTokenCache
-	bundles                   fleetcontrollers.BundleClient
+	bundles                   fleetcontrollers.BundleController
 	provClusters              rocontrollers.ClusterCache
 	controlPlanes             v1.RKEControlPlaneCache
+	managedCharts             v3.ManagedChartController
+	secrets                   corev1controllers.SecretController
 }
 
 func Register(ctx context.Context, clients *wrangler.Context) {
@@ -73,46 +78,29 @@ func Register(ctx context.Context, clients *wrangler.Context) {
 		bundles:                   clients.Fleet.Bundle(),
 		provClusters:              clients.Provisioning.Cluster().Cache(),
 		controlPlanes:             clients.RKE.RKEControlPlane().Cache(),
+		managedCharts:             clients.Mgmt.ManagedChart(),
+		secrets:                   clients.Core.Secret(),
 	}
 
 	v1.RegisterRKEControlPlaneStatusHandler(ctx, clients.RKE.RKEControlPlane(),
 		"", "monitor-system-upgrade-controller-readiness", h.syncSystemUpgradeControllerStatus)
 
-	rocontrollers.RegisterClusterGeneratingHandler(ctx, clients.Provisioning.Cluster(),
-		clients.Apply.
-			WithSetOwnerReference(false, false).
-			WithCacheTypes(clients.Fleet.Bundle(),
-				clients.Provisioning.Cluster(),
-				clients.Core.Secret(),
-				clients.RBAC.RoleBinding(),
-				clients.RBAC.Role(),
-				clients.RKE.RKEControlPlane()),
-		"", "manage-system-agent", h.OnChange, &generic.GeneratingHandlerOptions{
-			AllowCrossNamespace: true,
-		})
+	clients.Provisioning.Cluster().OnChange(ctx, "uninstall-fleet-managed-suc-and-system-agent", h.OnChangeUninstallFleetBasedApps)
+	clients.Provisioning.Cluster().OnChange(ctx, "install-system-agent", h.OnChangeInstallSystemAgent)
 
-	rocontrollers.RegisterClusterGeneratingHandler(ctx, clients.Provisioning.Cluster(),
-		clients.Apply.
-			WithSetOwnerReference(false, false).
-			WithCacheTypes(clients.Mgmt.ManagedChart(),
-				clients.Provisioning.Cluster()),
-		"", "manage-system-upgrade-controller", h.OnChangeInstallSUC, nil)
 }
-
-func (h *handler) OnChange(cluster *rancherv1.Cluster, status rancherv1.ClusterStatus) ([]runtime.Object, rancherv1.ClusterStatus, error) {
+func (h *handler) OnChangeInstallSystemAgent(_ string, cluster *rancherv1.Cluster) (*rancherv1.Cluster, error) {
+	if cluster == nil || cluster.DeletionTimestamp != nil {
+		return cluster, nil
+	}
 	if cluster.Spec.RKEConfig == nil || settings.SystemAgentUpgradeImage.Get() == "" {
-		return nil, status, nil
+		return cluster, nil
 	}
 
-	// Intentionally return an ErrSkip to prevent unnecessarily thrashing the corresponding bundle
-	// if the status field for fleetworkspacename has not yet been updated
-	if cluster.Status.FleetWorkspaceName == "" {
-		return nil, status, generic.ErrSkip
-	}
-
+	logrus.Infof("==== [managed-system-agent] attempt to Install System-Agent on %s", cluster.Name)
 	var (
 		secretName = "stv-aggregation"
-		result     []runtime.Object
+		resources  []runtime.Object
 	)
 
 	if cluster.Status.ClusterName == "local" && cluster.Namespace == fleetconst.ClustersLocalNamespace {
@@ -120,10 +108,10 @@ func (h *handler) OnChange(cluster *rancherv1.Cluster, status rancherv1.ClusterS
 
 		token, err := h.clusterRegistrationTokens.Get(cluster.Status.ClusterName, "default-token")
 		if err != nil {
-			return nil, status, err
+			return cluster, err
 		}
 		if token.Status.Token == "" {
-			return nil, status, fmt.Errorf("token not yet generated for %s/%s", token.Namespace, token.Name)
+			return cluster, fmt.Errorf("token not yet generated for %s/%s", token.Namespace, token.Name)
 		}
 
 		digest := sha256.New()
@@ -133,10 +121,17 @@ func (h *handler) OnChange(cluster *rancherv1.Cluster, status rancherv1.ClusterS
 		d := digest.Sum(nil)
 		secretName += hex.EncodeToString(d[:])[:12]
 
-		result = append(result, &corev1.Secret{
+		resources = append(resources, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      secretName,
 				Namespace: namespaces.System,
+				Annotations: map[string]string{
+					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
+					"meta.helm.sh/release-namespace": namespaces.System,
+				},
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "Helm",
+				},
 			},
 			Data: map[string][]byte{
 				"CATTLE_SERVER":      []byte(settings.InternalServerURL.Get()),
@@ -148,54 +143,45 @@ func (h *handler) OnChange(cluster *rancherv1.Cluster, status rancherv1.ClusterS
 
 	cp, err := h.controlPlanes.Get(cluster.Namespace, cluster.Name)
 	if err != nil {
-		logrus.Errorf("Error encountered getting RKE control plane while determining SUC readiness: %v", err)
-		return nil, status, err
+		logrus.Errorf("==== [managed-system-agent] Error encountered getting RKE control plane while determining SUC readiness: %v", err)
+		return cluster, err
 	}
 
 	if !capr.SystemUpgradeControllerReady.IsTrue(cp) {
 		// If the SUC is not ready do not create any plans, as those
 		// plans may depend on functionality only a newer version of the SUC contains
-		logrus.Debugf("[managesystemagent] the SUC is not yet ready, waiting to create system agent upgrade plans (SUC status: %s)", capr.SystemUpgradeControllerReady.GetStatus(cp))
-		return nil, status, generic.ErrSkip
+		logrus.Debugf("==== [managed-system-agent] the SUC is not yet ready, waiting to create system agent upgrade plans (SUC status: %s)", capr.SystemUpgradeControllerReady.GetStatus(cp))
+		return cluster, nil
 	}
 
-	resources, err := ToResources(installer(cluster, secretName))
+	resources = append(resources, installer(cluster, secretName)...)
+	// construct an Apply object
+	kcSecret, err := h.secrets.Cache().Get(cluster.Namespace, cluster.Name+"-kubeconfig")
 	if err != nil {
-		return nil, status, err
+		if errors.IsNotFound(err) {
+			return cluster, nil
+		}
+		return cluster, err
 	}
-
-	result = append(result, &v1alpha1.Bundle{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: cluster.Status.FleetWorkspaceName,
-			Name:      capr.SafeConcatName(capr.MaxHelmReleaseNameLength, cluster.Name, "managed", "system", "agent"),
-		},
-		Spec: v1alpha1.BundleSpec{
-			BundleDeploymentOptions: v1alpha1.BundleDeploymentOptions{
-				DefaultNamespace: namespaces.System,
-				// In the event that a controller updates the SUC Plan at the same time as
-				// fleet is attempting to update the plan via the bundle, we may end up with drift.
-				CorrectDrift: &v1alpha1.CorrectDrift{
-					Enabled: true,
-				},
-			},
-			Resources: resources,
-			Targets: []v1alpha1.BundleTarget{
-				{
-					ClusterName: cluster.Name,
-					ClusterSelector: &metav1.LabelSelector{
-						MatchExpressions: []metav1.LabelSelectorRequirement{
-							{
-								Key:      "provisioning.cattle.io/unmanaged-system-agent",
-								Operator: metav1.LabelSelectorOpDoesNotExist,
-							},
-						},
-					},
-				},
-			},
-		},
-	})
-
-	return result, status, nil
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kcSecret.Data["value"])
+	if err != nil {
+		return cluster, err
+	}
+	apply, err := apply.NewForConfig(restConfig)
+	if err != nil {
+		return cluster, err
+	}
+	logrus.Infof("==== [managed-system-agent] use Apply to create reseouces on %s", cluster.Name)
+	err = apply.
+		WithSetID("managed-system-agent").
+		WithDynamicLookup().
+		WithSetOwnerReference(false, false).
+		ApplyObjects(resources...)
+	if err != nil {
+		logrus.Infof("==== [managed-system-agent] Apply return errors: %s", err.Error())
+		return cluster, err
+	}
+	return cluster, nil
 }
 
 func installer(cluster *rancherv1.Cluster, secretName string) []runtime.Object {
@@ -258,7 +244,12 @@ func installer(cluster *rancherv1.Cluster, secretName string) []runtime.Object {
 			Name:      systemAgentUpgraderServiceAccountName,
 			Namespace: namespaces.System,
 			Annotations: map[string]string{
-				upgradeDigestAnnotation: "spec.upgrade.envs,spec.upgrade.envFrom",
+				"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
+				"meta.helm.sh/release-namespace": namespaces.System,
+				upgradeDigestAnnotation:          "spec.upgrade.envs,spec.upgrade.envFrom",
+			},
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "Helm",
 			},
 		},
 		Spec: upgradev1.PlanSpec{
@@ -316,11 +307,25 @@ func installer(cluster *rancherv1.Cluster, secretName string) []runtime.Object {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      systemAgentUpgraderServiceAccountName,
 				Namespace: namespaces.System,
+				Annotations: map[string]string{
+					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
+					"meta.helm.sh/release-namespace": namespaces.System,
+				},
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "Helm",
+				},
 			},
 		},
 		&rbacv1.ClusterRole{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: systemAgentUpgraderServiceAccountName,
+				Annotations: map[string]string{
+					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
+					"meta.helm.sh/release-namespace": namespaces.System,
+				},
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "Helm",
+				},
 			},
 			Rules: []rbacv1.PolicyRule{{
 				Verbs:     []string{"get"},
@@ -331,6 +336,13 @@ func installer(cluster *rancherv1.Cluster, secretName string) []runtime.Object {
 		&rbacv1.ClusterRoleBinding{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: systemAgentUpgraderServiceAccountName,
+				Annotations: map[string]string{
+					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
+					"meta.helm.sh/release-namespace": namespaces.System,
+				},
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "Helm",
+				},
 			},
 			Subjects: []rbacv1.Subject{{
 				Kind:      "ServiceAccount",
@@ -357,6 +369,13 @@ func installer(cluster *rancherv1.Cluster, secretName string) []runtime.Object {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      generationSecretName,
 				Namespace: namespaces.System,
+				Annotations: map[string]string{
+					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
+					"meta.helm.sh/release-namespace": namespaces.System,
+				},
+				Labels: map[string]string{
+					"app.kubernetes.io/managed-by": "Helm",
+				},
 			},
 			StringData: map[string]string{
 				"cluster-uid": string(cluster.UID),
@@ -384,7 +403,12 @@ func winsUpgradePlan(cluster *rancherv1.Cluster, env []corev1.EnvVar, secretName
 			Name:      "system-agent-upgrader-windows",
 			Namespace: namespaces.System,
 			Annotations: map[string]string{
-				upgradeDigestAnnotation: "spec.upgrade.envs,spec.upgrade.envFrom",
+				"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
+				"meta.helm.sh/release-namespace": namespaces.System,
+				upgradeDigestAnnotation:          "spec.upgrade.envs,spec.upgrade.envFrom",
+			},
+			Labels: map[string]string{
+				"app.kubernetes.io/managed-by": "Helm",
 			},
 		},
 		Spec: upgradev1.PlanSpec{
@@ -465,34 +489,66 @@ func CurrentVersionResolvesGH5551(version string) bool {
 	return curSemVer.GreaterThanEqual(GH5551FixedVersions[int(minor)])
 }
 
-func ToResources(objs []runtime.Object) (result []v1alpha1.BundleResource, err error) {
-	for _, obj := range objs {
-		obj = obj.DeepCopyObject()
-		if err := gvk.Set(obj); err != nil {
-			return nil, fmt.Errorf("failed to set gvk: %w", err)
-		}
-
-		typeMeta, err := meta.TypeAccessor(obj)
-		if err != nil {
-			return nil, err
-		}
-
-		meta, err := meta.Accessor(obj)
-		if err != nil {
-			return nil, err
-		}
-
-		data, err := json.Marshal(obj)
-		if err != nil {
-			return nil, err
-		}
-
-		digest := sha256.Sum256(data)
-		filename := name.SafeConcatName(typeMeta.GetKind(), meta.GetNamespace(), meta.GetName(), hex.EncodeToString(digest[:])[:12]) + ".yaml"
-		result = append(result, v1alpha1.BundleResource{
-			Name:    filename,
-			Content: string(data),
-		})
+func (h *handler) OnChangeUninstallFleetBasedApps(_ string, cluster *rancherv1.Cluster) (*rancherv1.Cluster, error) {
+	if cluster == nil || cluster.DeletionTimestamp != nil {
+		return cluster, nil
 	}
-	return
+	if cluster.Spec.RKEConfig == nil {
+		return cluster, nil
+	}
+	// the absence of the FleetWorkspaceName indicates that Fleet is not ready on the cluster, so do Fleet bundles
+	if cluster.Status.FleetWorkspaceName == "" {
+		return cluster, nil
+	}
+	// skip if the cluster is undergoing an upgrade or not in the ready state
+	if !(capr.Updated.IsTrue(cluster) && capr.Provisioned.IsTrue(cluster) && capr.Ready.IsTrue(cluster)) {
+		return cluster, nil
+	}
+	if globalCounter.Load() < int32(settings.K3sBasedUpgraderUninstallConcurrency.GetInt()) {
+		globalCounter.Add(1)
+		defer globalCounter.Add(-1)
+		// Step 1: uninstall the system-agent bundle
+		logrus.Infof("==== [managed-system-agent] attempt to uninstall system-agent  [%s] on %s", systemAgentAppName(cluster.Name), cluster.Name)
+		sa, err := h.bundles.Cache().Get(cluster.Status.FleetWorkspaceName, systemAgentAppName(cluster.Name))
+		if err != nil {
+			if errors.IsNotFound(err) {
+				logrus.Infof("==== [managed-system-agent] system agent bundle does not exist")
+				return cluster, nil
+			}
+			return nil, err
+		}
+		if err := h.bundles.Delete(sa.Namespace, sa.Name, &metav1.DeleteOptions{}); err != nil {
+			logrus.Errorf("==== [managed-system-agent] hit errors: %v", err)
+			if errors.IsNotFound(err) {
+				return cluster, nil
+			}
+			return nil, err
+		}
+		logrus.Infof("==== [managed-system-agent] system-agent bunddles deleted")
+
+		// step 2: uninstall the system-upgrade-controller managedChart
+		sucName := capr.SafeConcatName(48, cluster.Name, "managed", "system-upgrade-controller")
+		app, err := h.managedCharts.Cache().Get(cluster.Status.FleetWorkspaceName, sucName)
+		if err != nil {
+			if errors.IsNotFound(err) {
+				logrus.Infof("==== [managed-system-agent] system-upgrade-controller managed chart does not exist")
+				return cluster, nil
+			}
+			return nil, err
+		}
+		logrus.Infof("==== [managed-system-agent] attempt to uninstall SUC managed chart [%s] on %s", sucName, cluster.Name)
+		if err := h.managedCharts.Delete(app.Namespace, app.Name, &metav1.DeleteOptions{}); err != nil {
+			logrus.Errorf("==== [managed-system-agent] hit errors: %v", err)
+			if errors.IsNotFound(err) {
+				return cluster, nil
+			}
+			return nil, err
+		}
+		logrus.Infof("==== [managed-system-agent] system-upgrade-controller managed charts deleted")
+	}
+	return cluster, nil
+}
+
+func systemAgentAppName(clusterName string) string {
+	return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, clusterName, "managed", "system", "agent")
 }
