@@ -17,6 +17,7 @@ import (
 	"github.com/rancher/rancher/pkg/controllers/managementuser/nsserviceaccount"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/rbac"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/resourcequota"
+	"github.com/rancher/rancher/pkg/controllers/managementuser/rkecontrolplancondition"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/secret"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/snapshotbackpopulate"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/windows"
@@ -48,6 +49,13 @@ func Register(ctx context.Context, mgmt *config.ScaledContext, cluster *config.U
 
 		machinerole.Register(ctx, cluster)
 	}
+	// register the handler on the cluster agent of a node-driver RKE2/K3s cluster
+	if features.MCMAgent.Enabled() &&
+		clusterRec.Status.Driver == apimgmtv3.ClusterDriverImported &&
+		(clusterRec.Status.Provider == apimgmtv3.ClusterDriverRke2 || clusterRec.Status.Provider == apimgmtv3.ClusterDriverK3s) {
+		rkecontrolplancondition.Register(ctx, cluster)
+	}
+
 	cavalidator.Register(ctx, cluster)
 
 	registerImpersonationCaches(cluster)

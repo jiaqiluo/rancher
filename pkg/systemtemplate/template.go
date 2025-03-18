@@ -203,6 +203,10 @@ spec:
             value: "{{.ClusterRegistry}}"
           - name: CATTLE_CREDENTIAL_NAME
             value: cattle-credentials-{{.TokenKey}}
+          - name: CATTLE_MANAGED_SUC_APP_NAME_OVERRIDE
+            value: "{{.ManagedSUCAppNameOverride}}"
+          - name: CATTLE_CLUSTER_DISPLAY_NAME
+            value: "{{.ClusterDisplayName}}"
           {{- if .IsPreBootstrap }}
           # since we're on the host network, talk to the apiserver over localhost
           {{- end }}
