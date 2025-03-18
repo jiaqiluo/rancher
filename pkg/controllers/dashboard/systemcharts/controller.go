@@ -4,11 +4,13 @@ package systemcharts
 import (
 	"context"
 	"fmt"
+	"os"
 	"slices"
 	"time"
 
 	catalog "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
+	"github.com/rancher/rancher/pkg/capr"
 	"github.com/rancher/rancher/pkg/controllers/dashboard/chart"
 	"github.com/rancher/rancher/pkg/controllers/management/importedclusterversionmanagement"
 	"github.com/rancher/rancher/pkg/controllers/management/k3sbasedupgrade"
@@ -38,9 +40,10 @@ import (
 const (
 	repoName             = "rancher-charts"
 	sucDeploymentName    = "system-upgrade-controller"
-	legacyAppLabel       = "io.cattle.field/appId"
 	legacyAppFinalizer   = "systemcharts.cattle.io/legacy-k3s-based-upgrader-deprecation"
 	managedPlanFinalizer = "systemcharts.cattle.io/rancher-managed-plan"
+	// mangedSucDeploymentAnno is added to the SUC chart since Rancher v2.12
+	mangedSucDeploymentAnno = "apps.cattle.io/managed-system-upgrade-controller"
 )
 
 var (
@@ -224,8 +227,18 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 			RemoveNamespace: !features.EmbeddedClusterAPI.Enabled(),
 		},
 		{
-			ReleaseNamespace:    namespace.System,
-			ReleaseName:         chart.SystemUpgradeControllerChartName,
+			ReleaseNamespace: namespace.System,
+			ReleaseName: func() string {
+				if os.Getenv("CATTLE_MANAGED_SUC_APP_NAME_OVERRIDE") == "true" {
+					clusterName := os.Getenv("CATTLE_CLUSTER_DISPLAY_NAME")
+					if clusterName != "" {
+						return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, "mcc",
+							capr.SafeConcatName(48, clusterName, "managed", "system-upgrade-controller"))
+					}
+					logrus.Warnf("CATTLE_MANAGED_SUC_APP_NAME_OVERRIDE is empty, using the default app name")
+				}
+				return chart.SystemUpgradeControllerChartName
+			}(),
 			ChartName:           chart.SystemUpgradeControllerChartName,
 			ExactVersionSetting: settings.SystemUpgradeControllerChartVersion,
 			Values: func() map[string]interface{} {
@@ -250,26 +263,22 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 				return data.MergeMaps(values, configMapValues)
 			},
 			Enabled: func() bool {
-				toEnable := false
+				toEnable := true
 				suc, err := h.deploymentCache.Get(namespace.System, sucDeploymentName)
-
-				// the absence of the deployment or the absence of the legacy label on the existing deployment indicate
-				// that the old rancher-k3s/rke2-upgrader Project App has been removed
-				if err != nil {
-					if errors.IsNotFound(err) {
-						toEnable = true
-					} else {
-						logrus.Warnf("[systemcharts] failed to get the deployment %s/%s: %v", namespace.System, sucDeploymentName, err)
-					}
+				if err != nil && !errors.IsNotFound(err) {
+					toEnable = false
+					logrus.Warnf("[systemcharts] failed to get the deployment %s/%s: %s", namespace.System, sucDeploymentName, err.Error())
 				}
 				if suc != nil {
-					if _, ok := suc.Labels[legacyAppLabel]; !ok {
-						toEnable = true
+					// the absence of the annotation indicates that the old Fleet bundle, in the case of node-driver cluster,
+					// or the old rancher-k3s/rke2-upgrader Project App, in the case of imported cluster, the still exists
+					if _, ok := suc.Annotations[mangedSucDeploymentAnno]; !ok {
+						toEnable = false
 					}
 				}
 				var versionManagementEnabled bool
 				if features.MCMAgent.Enabled() {
-					// For the imported RKE2/K3s cluster,
+					// For the imported or node-driver RKE2/K3s cluster,
 					// cluster agent checks the ManagedSystemUpgradeController feature in the imported cluster
 					versionManagementEnabled = features.ManagedSystemUpgradeController.Enabled()
 				}
@@ -351,17 +360,18 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 
 // onDeployment enqueues the rancher-charts ClusterRepo to the controller's processing queue
 // when a specific event occurs on the target deployment. It is currently used to manage
-// the migration from the legacy k3s-based-upgrader app to the system-upgrade-controller app.
+// the migration from the legacy k3s-based-upgrader app to the system-upgrade-controller app, and
+// the migration from the fleet-managed system-upgrade-controller to the system-upgrade-controller app
 func (h *handler) onDeployment(_ string, d *k8sappsv1.Deployment) (*k8sappsv1.Deployment, error) {
 	if d == nil || d.Namespace != namespace.System || d.Name != sucDeploymentName {
 		return d, nil
 	}
-	if appName, ok := d.Labels[legacyAppLabel]; !ok || (appName != k3sbasedupgrade.K3sAppName && appName != k3sbasedupgrade.Rke2AppName) {
+	if _, ok := d.Annotations[mangedSucDeploymentAnno]; ok {
 		return d, nil
 	}
+
 	index := slices.Index(d.Finalizers, legacyAppFinalizer)
-	logrus.Debugf("[systemcharts] found deployment %s/%s with label %s=%s, index of target finalzier = %d",
-		d.Namespace, d.Name, legacyAppLabel, d.Labels[legacyAppLabel], index)
+	logrus.Infof("[systemcharts] found deployment %s/%s with index of target finalzier = %d", d.Namespace, d.Name, index)
 	if (d.DeletionTimestamp != nil && index == -1) || (d.DeletionTimestamp == nil && index >= 0) {
 		return d, nil
 	}
