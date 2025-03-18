@@ -82,8 +82,8 @@ func Register(ctx context.Context, clients *wrangler.Context) {
 		secrets:                   clients.Core.Secret(),
 	}
 
-	v1.RegisterRKEControlPlaneStatusHandler(ctx, clients.RKE.RKEControlPlane(),
-		"", "monitor-system-upgrade-controller-readiness", h.syncSystemUpgradeControllerStatus)
+	// v1.RegisterRKEControlPlaneStatusHandler(ctx, clients.RKE.RKEControlPlane(),
+	// 	"", "monitor-system-upgrade-controller-readiness", h.syncSystemUpgradeControllerStatus)
 
 	clients.Provisioning.Cluster().OnChange(ctx, "uninstall-fleet-managed-suc-and-system-agent", h.OnChangeUninstallFleetBasedApps)
 	clients.Provisioning.Cluster().OnChange(ctx, "install-system-agent", h.OnChangeInstallSystemAgent)
@@ -94,6 +94,10 @@ func (h *handler) OnChangeInstallSystemAgent(_ string, cluster *rancherv1.Cluste
 		return cluster, nil
 	}
 	if cluster.Spec.RKEConfig == nil || settings.SystemAgentUpgradeImage.Get() == "" {
+		return cluster, nil
+	}
+	// skip if the cluster is undergoing an upgrade or not in the ready state
+	if !(capr.Updated.IsTrue(cluster) && capr.Provisioned.IsTrue(cluster) && capr.Ready.IsTrue(cluster)) {
 		return cluster, nil
 	}
 
