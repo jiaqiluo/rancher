@@ -55,9 +55,7 @@ type clusterAgentContext struct {
 	ClusterRegistry       string
 	EnablePriorityClass   bool
 	PodDisruptionBudget   string
-
-	ManagedSUCAppNameOverride bool
-	ClusterDisplayName        string
+	SUCAppNameOverride    string
 }
 
 type priorityClassContext struct {
@@ -240,15 +238,15 @@ func SystemTemplate(resp io.Writer, agentImage, authImage, namespace, token, url
 		ClusterRegistry:       registryURL,
 		PodDisruptionBudget:   pdb,
 		EnablePriorityClass:   pcExists && pcEnabled,
-		ManagedSUCAppNameOverride: func() bool {
+		SUCAppNameOverride: func() string {
 			// for node-driver rke2/k3s cluster
 			if cluster.Status.Driver == apimgmtv3.ClusterDriverImported &&
 				(cluster.Status.Provider == apimgmtv3.ClusterDriverRke2 || cluster.Status.Provider == apimgmtv3.ClusterDriverK3s) {
-				return true
+				return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, "mcc",
+					capr.SafeConcatName(48, cluster.Spec.DisplayName, "managed", "system-upgrade-controller"))
 			}
-			return false
+			return ""
 		}(),
-		ClusterDisplayName: cluster.Spec.DisplayName,
 	}
 
 	return t.Execute(resp, context)

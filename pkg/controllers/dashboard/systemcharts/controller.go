@@ -10,7 +10,6 @@ import (
 
 	catalog "github.com/rancher/rancher/pkg/apis/catalog.cattle.io/v1"
 	v3 "github.com/rancher/rancher/pkg/apis/management.cattle.io/v3"
-	"github.com/rancher/rancher/pkg/capr"
 	"github.com/rancher/rancher/pkg/controllers/dashboard/chart"
 	"github.com/rancher/rancher/pkg/controllers/management/importedclusterversionmanagement"
 	"github.com/rancher/rancher/pkg/controllers/management/k3sbasedupgrade"
@@ -229,13 +228,8 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 		{
 			ReleaseNamespace: namespace.System,
 			ReleaseName: func() string {
-				if os.Getenv("CATTLE_MANAGED_SUC_APP_NAME_OVERRIDE") == "true" {
-					clusterName := os.Getenv("CATTLE_CLUSTER_DISPLAY_NAME")
-					if clusterName != "" {
-						return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, "mcc",
-							capr.SafeConcatName(48, clusterName, "managed", "system-upgrade-controller"))
-					}
-					logrus.Warnf("CATTLE_MANAGED_SUC_APP_NAME_OVERRIDE is empty, using the default app name")
+				if name := os.Getenv("CATTLE_SUC_APP_NAME_OVERRIDE"); name != "" {
+					return name
 				}
 				return chart.SystemUpgradeControllerChartName
 			}(),
