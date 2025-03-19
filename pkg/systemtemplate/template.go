@@ -207,6 +207,8 @@ spec:
             value: "{{.ManagedSUCAppNameOverride}}"
           - name: CATTLE_CLUSTER_DISPLAY_NAME
             value: "{{.ClusterDisplayName}}"
+          - name: CATTLE_SUC_APP_NAME_OVERRIDE
+            value: "{{.SUCAppNameOverride}}"
           {{- if .IsPreBootstrap }}
           # since we're on the host network, talk to the apiserver over localhost
           {{- end }}
