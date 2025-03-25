@@ -25,6 +25,7 @@ import (
 	"github.com/rancher/rancher/pkg/features"
 	"github.com/rancher/rancher/pkg/impersonation"
 	"github.com/rancher/rancher/pkg/types/config"
+	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -45,15 +46,11 @@ func Register(ctx context.Context, mgmt *config.ScaledContext, cluster *config.U
 				cluster.K3s = k3s.New(cluster.ControllerFactory)
 				snapshotbackpopulate.Register(ctx, cluster)
 			}
+			logrus.Infof("==== registering the controller for cluster %s: [%v] ==== ", clusterRec.Name, clusterRec)
+			rkecontrolplancondition.Register(ctx, cluster)
 		}
 
 		machinerole.Register(ctx, cluster)
-	}
-	// register the handler on the cluster agent of a node-driver RKE2/K3s cluster
-	if features.MCMAgent.Enabled() &&
-		clusterRec.Status.Driver == apimgmtv3.ClusterDriverImported &&
-		(clusterRec.Status.Provider == apimgmtv3.ClusterDriverRke2 || clusterRec.Status.Provider == apimgmtv3.ClusterDriverK3s) {
-		rkecontrolplancondition.Register(ctx, cluster)
 	}
 
 	cavalidator.Register(ctx, cluster)

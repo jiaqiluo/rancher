@@ -17,8 +17,8 @@ import (
 )
 
 type handler struct {
-	clusterName               string
-	appCache                  catalogv1.AppCache
+	mgmtClusterName           string
+	downstreamAppCache        catalogv1.AppCache
 	upstreamProvClustersCache rocontrollers.ClusterCache
 }
 
@@ -27,8 +27,8 @@ func Register(ctx context.Context, context *config.UserContext) {
 	mgmtWrangler := context.Management.Wrangler
 
 	h := handler{
-		clusterName:               context.ClusterName,
-		appCache:                  context.Catalog.V1().App().Cache(),
+		mgmtClusterName:           context.ClusterName,
+		downstreamAppCache:        context.Catalog.V1().App().Cache(),
 		upstreamProvClustersCache: mgmtWrangler.Provisioning.Cluster().Cache(),
 	}
 
@@ -39,22 +39,19 @@ func Register(ctx context.Context, context *config.UserContext) {
 // syncSystemUpgradeControllerStatus queries the managed system-upgrade-controller chart and determines if it is properly configured for a given
 // version of Kubernetes. It applies a condition onto the control-plane object to be used by the planner when handling Kubernetes upgrades.
 func (h *handler) syncSystemUpgradeControllerStatus(obj *rkev1.RKEControlPlane, status rkev1.RKEControlPlaneStatus) (rkev1.RKEControlPlaneStatus, error) {
-	// v1cluster, err := h.upstreamProvClustersCache.Get(obj.Namespace, obj.Name)
-	// if err != nil {
-	// 	return status, err
-	// }
-	// if v1cluster.Status.ClusterName != h.clusterName {
-	// 	return status, err
-	// }
-	if obj.Name != h.clusterName {
+	logrus.Infof("==== [rkecontrolplancondition] syncSystemUpgradeControllerStatus is called for RKEControlPlane %s", obj.Name)
+	if !obj.DeletionTimestamp.IsZero() {
 		return status, nil
 	}
-	logrus.Infof("==== [rkecontrolplancondition] sync staus for cluster %s", h.clusterName)
+	if obj.Spec.ManagementClusterName != h.mgmtClusterName {
+		return status, nil
+	}
+	logrus.Infof("==== [rkecontrolplancondition] sync staus for cluster %s", h.mgmtClusterName)
 
-	app, err := h.appCache.Get("cattle-system", "system-upgrade-controller")
+	app, err := h.downstreamAppCache.Get("cattle-system", "system-upgrade-controller")
 	if err != nil {
 		if errors.IsNotFound(err) {
-			logrus.Infof("==== [rkecontrolplancondition] suc app is not found on cluster %s", h.clusterName)
+			logrus.Infof("==== [rkecontrolplancondition] suc app is not found on cluster %s", h.mgmtClusterName)
 			// if we couldn't find the app then we know it's not ready
 			capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("unable to find system-upgrade-controller app: %v", err))
 			capr.SystemUpgradeControllerReady.Message(&status, "")
