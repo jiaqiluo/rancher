@@ -29,6 +29,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
+	meta2 "k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/clientcmd"
@@ -100,6 +101,10 @@ func (h *handler) OnChangeInstallSystemAgent(_ string, cluster *rancherv1.Cluste
 	if !(capr.Updated.IsTrue(cluster) && capr.Provisioned.IsTrue(cluster) && capr.Ready.IsTrue(cluster)) {
 		return cluster, nil
 	}
+	// skip if the cluster's kubeconfig is not populated
+	if cluster.Status.ClientSecretName == "" {
+		return cluster, nil
+	}
 
 	logrus.Infof("==== [managed-system-agent] attempt to Install System-Agent on %s", cluster.Name)
 	var (
@@ -129,13 +134,6 @@ func (h *handler) OnChangeInstallSystemAgent(_ string, cluster *rancherv1.Cluste
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      secretName,
 				Namespace: namespaces.System,
-				Annotations: map[string]string{
-					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
-					"meta.helm.sh/release-namespace": namespaces.System,
-				},
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by": "Helm",
-				},
 			},
 			Data: map[string][]byte{
 				"CATTLE_SERVER":      []byte(settings.InternalServerURL.Get()),
@@ -160,7 +158,7 @@ func (h *handler) OnChangeInstallSystemAgent(_ string, cluster *rancherv1.Cluste
 
 	resources = append(resources, installer(cluster, secretName)...)
 	// construct an Apply object
-	kcSecret, err := h.secrets.Cache().Get(cluster.Namespace, cluster.Name+"-kubeconfig")
+	kcSecret, err := h.secrets.Cache().Get(cluster.Namespace, cluster.Status.ClientSecretName)
 	if err != nil {
 		if errors.IsNotFound(err) {
 			return cluster, nil
@@ -176,10 +174,37 @@ func (h *handler) OnChangeInstallSystemAgent(_ string, cluster *rancherv1.Cluste
 		return cluster, err
 	}
 	logrus.Infof("==== [managed-system-agent] use Apply to create reseouces on %s", cluster.Name)
+
+	injectLabelAnnotation := func(config []runtime.Object) ([]runtime.Object, error) {
+		for _, obj := range config {
+			meta, err := meta2.Accessor(obj)
+			if err != nil {
+				return nil, err
+			}
+			if meta != nil {
+				annotations := meta.GetAnnotations()
+				if annotations == nil {
+					annotations = map[string]string{}
+				}
+				annotations["meta.helm.sh/release-name"] = systemAgentAppName(cluster.Name)
+				annotations["meta.helm.sh/release-namespace"] = namespaces.System
+				meta.SetAnnotations(annotations)
+				labels := meta.GetLabels()
+				if labels == nil {
+					labels = map[string]string{}
+				}
+				labels["app.kubernetes.io/managed-by"] = "Helm"
+				meta.SetLabels(labels)
+			}
+		}
+		return config, nil
+	}
 	err = apply.
 		WithSetID("managed-system-agent").
 		WithDynamicLookup().
-		WithSetOwnerReference(false, false).
+		WithInjector(injectLabelAnnotation).
+		WithListerNamespace(namespaces.System).
+		WithDefaultNamespace(namespaces.System).
 		ApplyObjects(resources...)
 	if err != nil {
 		logrus.Infof("==== [managed-system-agent] Apply return errors: %s", err.Error())
@@ -248,12 +273,7 @@ func installer(cluster *rancherv1.Cluster, secretName string) []runtime.Object {
 			Name:      systemAgentUpgraderServiceAccountName,
 			Namespace: namespaces.System,
 			Annotations: map[string]string{
-				"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
-				"meta.helm.sh/release-namespace": namespaces.System,
-				upgradeDigestAnnotation:          "spec.upgrade.envs,spec.upgrade.envFrom",
-			},
-			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "Helm",
+				upgradeDigestAnnotation: "spec.upgrade.envs,spec.upgrade.envFrom",
 			},
 		},
 		Spec: upgradev1.PlanSpec{
@@ -311,25 +331,11 @@ func installer(cluster *rancherv1.Cluster, secretName string) []runtime.Object {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      systemAgentUpgraderServiceAccountName,
 				Namespace: namespaces.System,
-				Annotations: map[string]string{
-					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
-					"meta.helm.sh/release-namespace": namespaces.System,
-				},
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by": "Helm",
-				},
 			},
 		},
 		&rbacv1.ClusterRole{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: systemAgentUpgraderServiceAccountName,
-				Annotations: map[string]string{
-					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
-					"meta.helm.sh/release-namespace": namespaces.System,
-				},
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by": "Helm",
-				},
 			},
 			Rules: []rbacv1.PolicyRule{{
 				Verbs:     []string{"get"},
@@ -340,13 +346,6 @@ func installer(cluster *rancherv1.Cluster, secretName string) []runtime.Object {
 		&rbacv1.ClusterRoleBinding{
 			ObjectMeta: metav1.ObjectMeta{
 				Name: systemAgentUpgraderServiceAccountName,
-				Annotations: map[string]string{
-					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
-					"meta.helm.sh/release-namespace": namespaces.System,
-				},
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by": "Helm",
-				},
 			},
 			Subjects: []rbacv1.Subject{{
 				Kind:      "ServiceAccount",
@@ -373,13 +372,6 @@ func installer(cluster *rancherv1.Cluster, secretName string) []runtime.Object {
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      generationSecretName,
 				Namespace: namespaces.System,
-				Annotations: map[string]string{
-					"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
-					"meta.helm.sh/release-namespace": namespaces.System,
-				},
-				Labels: map[string]string{
-					"app.kubernetes.io/managed-by": "Helm",
-				},
 			},
 			StringData: map[string]string{
 				"cluster-uid": string(cluster.UID),
@@ -407,12 +399,7 @@ func winsUpgradePlan(cluster *rancherv1.Cluster, env []corev1.EnvVar, secretName
 			Name:      "system-agent-upgrader-windows",
 			Namespace: namespaces.System,
 			Annotations: map[string]string{
-				"meta.helm.sh/release-name":      systemAgentAppName(cluster.Name),
-				"meta.helm.sh/release-namespace": namespaces.System,
-				upgradeDigestAnnotation:          "spec.upgrade.envs,spec.upgrade.envFrom",
-			},
-			Labels: map[string]string{
-				"app.kubernetes.io/managed-by": "Helm",
+				upgradeDigestAnnotation: "spec.upgrade.envs,spec.upgrade.envFrom",
 			},
 		},
 		Spec: upgradev1.PlanSpec{
