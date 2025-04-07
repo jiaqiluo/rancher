@@ -14,11 +14,12 @@ import (
 	"github.com/rancher/rancher/pkg/types/config"
 	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 type handler struct {
 	mgmtClusterName           string
-	downstreamAppCache        catalogv1.AppCache
+	downstreamAppController   catalogv1.AppClient
 	upstreamProvClustersCache rocontrollers.ClusterCache
 }
 
@@ -28,7 +29,7 @@ func Register(ctx context.Context, context *config.UserContext) {
 
 	h := handler{
 		mgmtClusterName:           context.ClusterName,
-		downstreamAppCache:        context.Catalog.V1().App().Cache(),
+		downstreamAppController:   context.Catalog.V1().App(),
 		upstreamProvClustersCache: mgmtWrangler.Provisioning.Cluster().Cache(),
 	}
 
@@ -48,7 +49,7 @@ func (h *handler) syncSystemUpgradeControllerStatus(obj *rkev1.RKEControlPlane, 
 	}
 	logrus.Infof("==== [rkecontrolplancondition] sync staus for cluster %s", h.mgmtClusterName)
 
-	app, err := h.downstreamAppCache.Get("cattle-system", "system-upgrade-controller")
+	app, err := h.downstreamAppController.Get("cattle-system", "system-upgrade-controller", metav1.GetOptions{})
 	if err != nil {
 		if errors.IsNotFound(err) {
 			logrus.Infof("==== [rkecontrolplancondition] suc app is not found on cluster %s", h.mgmtClusterName)
