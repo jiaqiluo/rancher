@@ -112,6 +112,7 @@ const (
 	InfrastructureReady          = condition.Cond(capi.InfrastructureReadyCondition)
 	SystemUpgradeControllerReady = condition.Cond("SystemUpgradeControllerReady")
 	Bootstrapped                 = condition.Cond("Bootstrapped")
+	SystemAgentResourcesReady    = condition.Cond("SystemAgentResourcesReady")
 
 	RuntimeK3S  = "k3s"
 	RuntimeRKE2 = "rke2"

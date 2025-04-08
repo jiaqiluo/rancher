@@ -156,6 +156,11 @@ func (h *handler) OnChangeInstallSystemAgent(_ string, cluster *rancherv1.Cluste
 		return cluster, nil
 	}
 
+	if capr.SystemAgentResourcesReady.IsTrue(cluster) {
+		// only need to create the reources one time
+		return cluster, nil
+	}
+
 	resources = append(resources, installer(cluster, secretName)...)
 	// construct an Apply object
 	kcSecret, err := h.secrets.Cache().Get(cluster.Namespace, cluster.Status.ClientSecretName)

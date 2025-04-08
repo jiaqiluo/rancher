@@ -95,6 +95,9 @@ func runMigrations(wranglerContext *wrangler.Context) error {
 		if err := migrateMachinePoolsDynamicSchemaLabel(wranglerContext); err != nil {
 			return err
 		}
+		if err := resetProvisioningClusterCondition(wranglerContext); err != nil {
+			return err
+		}
 	}
 
 	if features.Harvester.Enabled() {
@@ -778,4 +781,23 @@ func insertOrUpdateCondition(d data.Object, desiredCondition summary.Condition) 
 	d.SetNested(conditions, "status", "conditions")
 
 	return true, nil
+}
+
+func resetProvisioningClusterCondition(w *wrangler.Context) error {
+	provClusters, err := w.Provisioning.Cluster().List("", metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	for _, cluster := range provClusters.Items {
+		clusterCopy := cluster.DeepCopy()
+		if capr.SystemAgentResourcesReady.IsTrue(clusterCopy.Status.Conditions) {
+			capr.SystemAgentResourcesReady.Unknown(clusterCopy.Status.Conditions)
+			capr.SystemAgentResourcesReady.Message(clusterCopy.Status.Conditions, "")
+			if _, err := w.Provisioning.Cluster().Update(clusterCopy); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
