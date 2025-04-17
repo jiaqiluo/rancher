@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 
 	provisioningv1 "github.com/rancher/rancher/pkg/apis/provisioning.cattle.io/v1"
 	"github.com/rancher/rancher/pkg/capr"
@@ -268,7 +269,11 @@ func Test_Provisioning_Custom_ThreeNodeWithTaints(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		var taint string
 		// Put a taint on one of the nodes.
-		if i == 1 {
+		if i == 2 {
+			// If the tainted node finishes registration first, no other machine is able to complete the registration
+			// process. As a result, the cluster ends up with only one node (the tainted one), and the pods for
+			// cattle-cluster-agent and other K3s bundled components remain in Pending state because they don't tolerate the taint.
+			time.Sleep(time.Second * 10)
 			taint = " --taint key=value:NoExecute"
 		}
 		_, err = systemdnode.New(clients, c.Namespace, "#!/usr/bin/env sh\n"+command+" --worker --etcd --controlplane --label rancher=awesome"+taint, map[string]string{"custom-cluster-name": c.Name}, nil)
