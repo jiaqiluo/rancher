@@ -17,6 +17,7 @@ import (
 	"github.com/rancher/rancher/pkg/controllers/managementuser/nsserviceaccount"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/rbac"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/resourcequota"
+	"github.com/rancher/rancher/pkg/controllers/managementuser/rkecontrolplancondition"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/secret"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/snapshotbackpopulate"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/windows"
@@ -24,6 +25,7 @@ import (
 	"github.com/rancher/rancher/pkg/features"
 	"github.com/rancher/rancher/pkg/impersonation"
 	"github.com/rancher/rancher/pkg/types/config"
+	"github.com/sirupsen/logrus"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
 
@@ -44,10 +46,13 @@ func Register(ctx context.Context, mgmt *config.ScaledContext, cluster *config.U
 				cluster.K3s = k3s.New(cluster.ControllerFactory)
 				snapshotbackpopulate.Register(ctx, cluster)
 			}
+			logrus.Infof("==== registering the controller for cluster %s: [%v] ==== ", clusterRec.Name, clusterRec)
+			rkecontrolplancondition.Register(ctx, cluster)
 		}
 
 		machinerole.Register(ctx, cluster)
 	}
+
 	cavalidator.Register(ctx, cluster)
 
 	registerImpersonationCaches(cluster)
