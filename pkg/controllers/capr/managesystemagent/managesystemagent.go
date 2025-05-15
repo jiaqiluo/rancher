@@ -3,7 +3,6 @@ package managesystemagent
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -124,7 +123,7 @@ func (h *handler) InstallSystemAgent(_ string, cluster *rancherv1.Cluster) (*ran
 	logrus.Infof("==== [managed-system-agent] attempt to Install System-Agent on %s", cluster.Name)
 	var (
 		secretName = "stv-aggregation"
-		resources  []runtime.Object
+		result     []runtime.Object
 	)
 
 	if cluster.Status.ClusterName == "local" && cluster.Namespace == fleetconst.ClustersLocalNamespace {
@@ -145,7 +144,7 @@ func (h *handler) InstallSystemAgent(_ string, cluster *rancherv1.Cluster) (*ran
 		d := digest.Sum(nil)
 		secretName += hex.EncodeToString(d[:])[:12]
 
-		resources = append(resources, &corev1.Secret{
+		result = append(result, &corev1.Secret{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      secretName,
 				Namespace: namespaces.System,
@@ -158,19 +157,18 @@ func (h *handler) InstallSystemAgent(_ string, cluster *rancherv1.Cluster) (*ran
 		})
 	}
 
-	resources = append(resources, installer(cluster, secretName)...)
+	result = append(result, installer(cluster, secretName)...)
 
-	// Caculate a hash value of the templates
-	data, err := json.Marshal(resources)
+	// Calculate a hash value of the templates
+	data, err := json.Marshal(result)
 	if err != nil {
 		return cluster, err
 	}
-	hash := sha256.Sum256(data)
-	b64 := base64.StdEncoding.EncodeToString(hash[:])
-	shortHash := b64[:12]
+	sum := sha256.Sum256(data)
+	hash := hex.EncodeToString(sum[:])
 
 	val, _ := cp.Annotations[appliedSystemAgentHashAnnotation]
-	if shortHash == val {
+	if hash == val {
 		logrus.Infof("=== [managed-system-agent] applied templates on cluster %s is already up-to-date", cluster.Name)
 		return cluster, nil
 	}
@@ -196,9 +194,8 @@ func (h *handler) InstallSystemAgent(_ string, cluster *rancherv1.Cluster) (*ran
 	err = apply.
 		WithSetID("managed-system-agent").
 		WithDynamicLookup().
-		WithListerNamespace(namespaces.System).
 		WithDefaultNamespace(namespaces.System).
-		ApplyObjects(resources...)
+		ApplyObjects(result...)
 	if err != nil {
 		logrus.Infof("==== [managed-system-agent] Apply return errors: %s", err.Error())
 		return cluster, err
@@ -209,7 +206,7 @@ func (h *handler) InstallSystemAgent(_ string, cluster *rancherv1.Cluster) (*ran
 	if cp.Annotations == nil {
 		cp.Annotations = map[string]string{}
 	}
-	cp.Annotations[appliedSystemAgentHashAnnotation] = shortHash
+	cp.Annotations[appliedSystemAgentHashAnnotation] = hash
 	if _, err := h.controlPlanes.Update(cp); err != nil {
 		logrus.Infof("==== [managed-system-agent] failed to update the annotation on the controlPlane: %s", err.Error())
 		return cluster, err
@@ -550,7 +547,7 @@ func (h *handler) UninstallFleetBasedApps(_ string, cluster *rancherv1.Cluster) 
 }
 
 func systemAgentAppName(clusterName string) string {
-	return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, clusterName, "managed", "system", "agent")
+	return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, clusterName, "managed", "system-agent")
 }
 
 func systemUpgradeControllerAppName(clusterName string) string {

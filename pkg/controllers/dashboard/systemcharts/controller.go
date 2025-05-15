@@ -168,7 +168,7 @@ func (h *handler) onRepo(key string, repo *catalog.ClusterRepo) (*catalog.Cluste
 		minVersion := chartDef.MinVersionSetting.Get()
 		exactVersion := chartDef.ExactVersionSetting.Get()
 		takeOwnership := chartDef.ChartName == chart.WebhookChartName || chartDef.ChartName == chart.ProvisioningCAPIChartName
-		if err := h.manager.Ensure(chartDef.ReleaseNamespace, chartDef.ReleaseName, chartDef.ChartName, minVersion, exactVersion, values, takeOwnership, installImageOverride); err != nil {
+		if err := h.manager.Ensure(chartDef.ReleaseNamespace, chartDef.ChartName, chartDef.ReleaseName, minVersion, exactVersion, values, takeOwnership, installImageOverride); err != nil {
 			return repo, err
 		}
 	}
