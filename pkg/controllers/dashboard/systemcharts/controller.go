@@ -41,7 +41,8 @@ const (
 	sucDeploymentName    = "system-upgrade-controller"
 	legacyAppFinalizer   = "systemcharts.cattle.io/legacy-k3s-based-upgrader-deprecation"
 	managedPlanFinalizer = "systemcharts.cattle.io/rancher-managed-plan"
-	// mangedSucDeploymentAnno is added to the SUC chart since Rancher v2.12
+
+	// mangedSucDeploymentAnno is added to the system-upgrade-controller chart since Rancher v2.12
 	mangedSucDeploymentAnno = "apps.cattle.io/managed-system-upgrade-controller"
 )
 
@@ -264,8 +265,8 @@ func (h *handler) getChartsToInstall() []*chart.Definition {
 					logrus.Warnf("[systemcharts] failed to get the deployment %s/%s: %s", namespace.System, sucDeploymentName, err.Error())
 				}
 				if suc != nil {
-					// the absence of the annotation indicates that the old Fleet bundle, in the case of node-driver cluster,
-					// or the old rancher-k3s/rke2-upgrader Project App, in the case of imported cluster, the still exists
+					// the absence of the annotation indicates that the old Fleet bundle in the node-driver cluster,
+					// or the old rancher-k3s/rke2-upgrader Project App in the imported cluster, still exists
 					if _, ok := suc.Annotations[mangedSucDeploymentAnno]; !ok {
 						toEnable = false
 					}

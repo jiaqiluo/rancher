@@ -98,25 +98,23 @@ func (h *handler) InstallSystemAgent(_ string, cluster *rancherv1.Cluster) (*ran
 	if cluster.Spec.RKEConfig == nil || settings.SystemAgentUpgradeImage.Get() == "" {
 		return cluster, nil
 	}
-	// skip if the cluster is undergoing an upgrade or not in the ready state
+	// Skip if the cluster is undergoing an upgrade or not in the ready state
 	if !capr.Updated.IsTrue(cluster) || !capr.Provisioned.IsTrue(cluster) || !capr.Ready.IsTrue(cluster) {
 		return cluster, nil
 	}
-	// skip if the cluster's kubeconfig is not populated
+	// Skip if the cluster's kubeconfig is not populated
 	if cluster.Status.ClientSecretName == "" {
 		return cluster, nil
 	}
 
 	cp, err := h.controlPlanes.Cache().Get(cluster.Namespace, cluster.Name)
 	if err != nil {
-		logrus.Errorf("==== [managed-system-agent] Error encountered getting RKE control plane while determining SUC readiness: %v", err)
 		return cluster, err
 	}
 
 	// skip if the SUC app is not ready,
 	// because plans may depend on functionality of a newer SUC version
 	if !capr.SystemUpgradeControllerReady.IsTrue(cp) {
-		logrus.Debugf("==== [managed-system-agent] the SUC is not yet ready, waiting to create system agent upgrade plans (SUC status: %s)", capr.SystemUpgradeControllerReady.GetStatus(cp))
 		return cluster, nil
 	}
 
@@ -489,20 +487,22 @@ func (h *handler) UninstallFleetBasedApps(_ string, cluster *rancherv1.Cluster) 
 	if cluster.Spec.RKEConfig == nil {
 		return cluster, nil
 	}
-	// the absence of the FleetWorkspaceName indicates that Fleet is not ready on the cluster, so do Fleet bundles
+	// The absence of the FleetWorkspaceName indicates that Fleet is not ready on the cluster, so do Fleet bundles
 	if cluster.Status.FleetWorkspaceName == "" {
 		return cluster, nil
 	}
-	// skip if the cluster is undergoing an upgrade or not in the ready state
+	// Skip if the cluster is undergoing an upgrade or not in the ready state
 	if !(capr.Updated.IsTrue(cluster) && capr.Provisioned.IsTrue(cluster) && capr.Ready.IsTrue(cluster)) {
 		return cluster, nil
 	}
 	if globalCounter.Load() < int32(settings.K3sBasedUpgraderUninstallConcurrency.GetInt()) {
 		globalCounter.Add(1)
 		defer globalCounter.Add(-1)
+
 		// Step 1: uninstall the system-agent bundle
-		logrus.Infof("==== [managed-system-agent] attempt to uninstall the bundle [%s] on %s", systemAgentAppName(cluster.Name), cluster.Name)
-		bundle, err := h.bundles.Cache().Get(cluster.Status.FleetWorkspaceName, systemAgentAppName(cluster.Name))
+		name := capr.SafeConcatName(capr.MaxHelmReleaseNameLength, cluster.Name, "managed", "system-agent")
+		logrus.Infof("==== [managed-system-agent] attempt to uninstall the bundle [%s] on %s", name, cluster.Name)
+		bundle, err := h.bundles.Cache().Get(cluster.Status.FleetWorkspaceName, name)
 		if err != nil {
 			if errors.IsNotFound(err) {
 				// todo: change to debug-level
@@ -522,7 +522,7 @@ func (h *handler) UninstallFleetBasedApps(_ string, cluster *rancherv1.Cluster) 
 		}
 
 		// step 2: uninstall the system-upgrade-controller managedChart(which is translated into a Fleet Bundle)
-		sucName := systemUpgradeControllerAppName(cluster.Name)
+		sucName := capr.SafeConcatName(48, cluster.Name, "managed", "system-upgrade-controller")
 		logrus.Infof("==== [managed-system-agent] attempt to uninstall SUC managed chart [%s] on %s", sucName, cluster.Name)
 		managedChart, err := h.managedCharts.Cache().Get(cluster.Status.FleetWorkspaceName, sucName)
 		if err != nil {
@@ -544,15 +544,4 @@ func (h *handler) UninstallFleetBasedApps(_ string, cluster *rancherv1.Cluster) 
 		}
 	}
 	return cluster, nil
-}
-
-func systemAgentAppName(clusterName string) string {
-	return capr.SafeConcatName(capr.MaxHelmReleaseNameLength, clusterName, "managed", "system-agent")
-}
-
-func systemUpgradeControllerAppName(clusterName string) string {
-	// we must limit the output of name.SafeConcatName to at most 48 characters because
-	// a) the chart release name cannot exceed 53 characters, and
-	// b) upon creation of this resource the prefix 'mcc-' will be added to the release name, hence the limiting to 48 characters
-	return capr.SafeConcatName(48, clusterName, "managed", "system-upgrade-controller")
 }

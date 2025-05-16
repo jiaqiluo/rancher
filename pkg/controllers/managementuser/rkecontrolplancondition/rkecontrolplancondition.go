@@ -57,7 +57,7 @@ func (h *handler) syncSystemUpgradeControllerStatus(obj *rkev1.RKEControlPlane, 
 		if errors.IsNotFound(err) {
 			logrus.Infof("==== [rkecontrolplancondition] suc app is not found on cluster %s", h.mgmtClusterName)
 			// if we couldn't find the app then we know it's not ready
-			capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("unable to find app %s: %v", appName, err))
+			capr.SystemUpgradeControllerReady.Reason(&status, err.Error())
 			capr.SystemUpgradeControllerReady.Message(&status, "")
 			capr.SystemUpgradeControllerReady.False(&status)
 			// don't return the error, otherwise the status won't be set to 'false'
@@ -67,9 +67,21 @@ func (h *handler) syncSystemUpgradeControllerStatus(obj *rkev1.RKEControlPlane, 
 		return status, err
 	}
 
+	logrus.Infof("==== [rkecontrolplancondition] see app generation %d", app.Generation)
+
+	if !app.DeletionTimestamp.IsZero() {
+		logrus.Infof("==== [rkecontrolplancondition] the old app is uninstalling %s", h.mgmtClusterName)
+		// if we couldn't find the app then we know it's not ready
+		capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("the app %s is uninstalled", app.Name))
+		capr.SystemUpgradeControllerReady.Message(&status, "")
+		capr.SystemUpgradeControllerReady.False(&status)
+		return status, nil
+	}
+
 	targetVersion := settings.SystemUpgradeControllerChartVersion.Get()
 	if app.Spec.Chart.Metadata.Version != targetVersion && targetVersion != "" {
-		capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("waiting for system-upgrade-controller app to update to the latest version %s", targetVersion))
+		logrus.Infof("==== [rkecontrolplancondition] waiting for system-upgrade-controller app to update to the latest version %s", targetVersion)
+		capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("waiting for %s to update to version %s", app.Name, targetVersion))
 		capr.SystemUpgradeControllerReady.Message(&status, "")
 		capr.SystemUpgradeControllerReady.False(&status)
 		return status, nil
@@ -82,15 +94,15 @@ func (h *handler) syncSystemUpgradeControllerStatus(obj *rkev1.RKEControlPlane, 
 		capr.SystemUpgradeControllerReady.Message(&status, "")
 		capr.SystemUpgradeControllerReady.True(&status)
 	case app.Status.Summary.Error:
-		capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("failed to install system-upgrade-controlle app (current state: %s)", state))
+		capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("failed to install %s: %s", app.Name, state))
 		capr.SystemUpgradeControllerReady.Message(&status, "")
 		capr.SystemUpgradeControllerReady.False(&status)
 	case app.Status.Summary.Transitioning:
-		capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("waiting for system-upgrade-controller app to roll out (current state: %s)", state))
+		capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("waiting for %s to roll out: %s", app.Name, state))
 		capr.SystemUpgradeControllerReady.Message(&status, "")
 		capr.SystemUpgradeControllerReady.Unknown(&status)
 	default:
-		capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("waiting for system-upgrade-controller app to roll out (current state: %s)", state))
+		capr.SystemUpgradeControllerReady.Reason(&status, fmt.Sprintf("waiting for %s to roll out: %s", app.Name, state))
 		capr.SystemUpgradeControllerReady.Message(&status, "")
 		capr.SystemUpgradeControllerReady.Unknown(&status)
 	}
