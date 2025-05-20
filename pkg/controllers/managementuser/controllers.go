@@ -17,6 +17,7 @@ import (
 	"github.com/rancher/rancher/pkg/controllers/managementuser/nsserviceaccount"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/rbac"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/resourcequota"
+	"github.com/rancher/rancher/pkg/controllers/managementuser/rkecontrolplanecondition"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/secret"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/snapshotbackpopulate"
 	"github.com/rancher/rancher/pkg/controllers/managementuser/windows"
@@ -44,6 +45,7 @@ func Register(ctx context.Context, mgmt *config.ScaledContext, cluster *config.U
 				cluster.K3s = k3s.New(cluster.ControllerFactory)
 				snapshotbackpopulate.Register(ctx, cluster)
 			}
+			rkecontrolplanecondition.Register(ctx, cluster)
 		}
 
 		machinerole.Register(ctx, cluster)
