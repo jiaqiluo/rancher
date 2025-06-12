@@ -151,6 +151,7 @@ func WaitForCreate(clients *clients.Clients, c *provisioningv1api.Cluster) (_ *p
 		}
 	}()
 
+	logrus.Infof("Waiting for provisioning cluster %s to be ready", c.Name)
 	err = wait.Object(clients.Ctx, clients.Provisioning.Cluster().Watch, c, func(obj runtime.Object) (bool, error) {
 		c = obj.(*provisioningv1api.Cluster)
 		return c.Status.ClusterName != "" && c.Status.Ready && c.Status.ObservedGeneration == c.Generation && capr.Ready.IsTrue(c) && capr.Provisioned.IsTrue(c), nil
@@ -203,6 +204,7 @@ func WaitForCreate(clients *clients.Clients, c *provisioningv1api.Cluster) (_ *p
 		if !machine.DeletionTimestamp.IsZero() {
 			continue
 		}
+		logrus.Infof("Waiting for machine %s of cluster %s to be ready", machine.Name, c.Name)
 		err = wait.Object(clients.Ctx, clients.CAPI.Machine().Watch, &machine, func(obj runtime.Object) (bool, error) {
 			machine = *obj.(*capi.Machine)
 			return machine.Status.NodeRef != nil, nil
@@ -217,6 +219,7 @@ func WaitForCreate(clients *clients.Clients, c *provisioningv1api.Cluster) (_ *p
 		return nil, err
 	}
 
+	logrus.Infof("Waiting for mgmt cluster %s to be ready", mgmtCluster.Name)
 	err = wait.Object(clients.Ctx, func(namespace string, opts metav1.ListOptions) (watch.Interface, error) {
 		return clients.Mgmt.Cluster().Watch(opts)
 	}, mgmtCluster, func(obj runtime.Object) (bool, error) {
@@ -246,6 +249,7 @@ func WaitForControlPlane(clients *clients.Clients, c *provisioningv1api.Cluster,
 		return nil, fmt.Errorf("%s wait did not succeed : %w", errorPrefix, err)
 	}
 
+	logrus.Infof("Waiting for ControlPlane %s to be ready", controlPlane.Name)
 	err = wait.Object(clients.Ctx, clients.RKE.RKEControlPlane().Watch, controlPlane, func(obj runtime.Object) (bool, error) {
 		controlPlane = obj.(*rkev1.RKEControlPlane)
 		return rkeControlPlaneCheckFunc(controlPlane)
@@ -587,6 +591,7 @@ func populatePodLogs(clients *clients.Clients, controlPlane *rkev1.RKEControlPla
 
 // EnsureMinimalConflictsWithThreshold walks through pod logs and ensures a minimal number of conflict messages have occurred.
 func EnsureMinimalConflictsWithThreshold(clients *clients.Clients, c *provisioningv1api.Cluster, threshold int) error {
+	logrus.Infof("EnsureMinimalConflictsWithThreshold walks through pod logs and ensures a minimal number of conflict messages have occurred. cluster %s", c.Name)
 	customPods, newErr := clients.Core.Pod().List(c.Namespace, metav1.ListOptions{
 		LabelSelector: "custom-cluster-name=" + c.Name,
 	})
@@ -609,6 +614,7 @@ func EnsureMinimalConflictsWithThreshold(clients *clients.Clients, c *provisioni
 		logrus.Errorf("failed to get machines for %s/%s to count conflicts: %v", c.Namespace, c.Name, newErr)
 	}
 	for _, machine := range machines.Items {
+		logrus.Infof("== checking machine %s", machine.Name)
 		im, newErr := clients.Dynamic.Resource(schema.GroupVersionResource{
 			Group:    machine.Spec.InfrastructureRef.GroupVersionKind().Group,
 			Version:  machine.Spec.InfrastructureRef.GroupVersionKind().Version,
@@ -630,5 +636,6 @@ func EnsureMinimalConflictsWithThreshold(clients *clients.Clients, c *provisioni
 			}
 		}
 	}
+	logrus.Infof("EnsureMinimalConflictsWithThreshold pass in cluster %s", c.Name)
 	return nil
 }

@@ -17,6 +17,7 @@ import (
 	"github.com/rancher/rancher/tests/v2prov/wait"
 	"github.com/rancher/wrangler/v3/pkg/name"
 	"github.com/rancher/wrangler/v3/pkg/randomtoken"
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +29,7 @@ import (
 // It then creates a new etcd node and restores from local snapshot file. This validates that it is possible to restore
 // a snapshot on a completely new etcd node from file (without a corresponding snapshot file)
 func Test_Operation_SetB_Custom_EtcdSnapshotOperationsOnNewNode(t *testing.T) {
+	logrus.Info("running Test_Operation_SetB_Custom_EtcdSnapshotOperationsOnNewNode")
 	clients, err := clients.New()
 	if err != nil {
 		t.Fatal(err)
@@ -99,6 +101,7 @@ func Test_Operation_SetB_Custom_EtcdSnapshotOperationsOnNewNode(t *testing.T) {
 	snapshot := operations.RunSnapshotCreateTest(t, clients, c, cm, "etcd-test-node")
 	assert.NotNil(t, snapshot)
 
+	logrus.Infof("deleting the etcd node pod of cluster %s", c.Name)
 	err = clients.Core.Pod().Delete(c.Namespace, etcdNodePodName, &metav1.DeleteOptions{PropagationPolicy: &[]metav1.DeletionPropagation{metav1.DeletePropagationForeground}[0]})
 	if err != nil {
 		t.Fatal(err)
@@ -111,6 +114,7 @@ func Test_Operation_SetB_Custom_EtcdSnapshotOperationsOnNewNode(t *testing.T) {
 	}
 
 	// Delete the machine from the cluster too...
+	logrus.Infof("deleting the etcd  machine of cluster %s", c.Name)
 	oldEtcdMachines, err := clients.CAPI.Machine().List(c.Namespace, metav1.ListOptions{LabelSelector: capr.EtcdRoleLabel + "=true"})
 	if err != nil {
 		t.Fatal(err)
@@ -127,6 +131,7 @@ func Test_Operation_SetB_Custom_EtcdSnapshotOperationsOnNewNode(t *testing.T) {
 		return strings.Contains(capr.Ready.GetMessage(&rkeControlPlane.Status), "waiting for at least one control plane, etcd, and worker node to be registered"), nil
 	})
 
+	logrus.Infof("adding a new etcd node to the cluster %s", c.Name)
 	_, err = systemdnode.New(clients, c.Namespace, "#!/usr/bin/env sh\n"+command+" --etcd", map[string]string{"custom-cluster-name": c.Name}, etcdSnapshotDir)
 	if err != nil {
 		t.Fatal(err)
@@ -139,4 +144,5 @@ func Test_Operation_SetB_Custom_EtcdSnapshotOperationsOnNewNode(t *testing.T) {
 	operations.RunSnapshotRestoreTest(t, clients, c, snapshot.SnapshotFile.Name, cm, 2)
 	err = cluster.EnsureMinimalConflictsWithThreshold(clients, c, cluster.SaneConflictMessageThreshold)
 	assert.NoError(t, err)
+	logrus.Info("Test_Operation_SetB_Custom_EtcdSnapshotOperationsOnNewNode pass")
 }

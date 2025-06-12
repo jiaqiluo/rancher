@@ -38,6 +38,7 @@ func RunSnapshotCreateTest(t *testing.T, clients *clients.Clients, c *v1.Cluster
 		}
 	}()
 
+	logrus.Infof("Running RunSnapshotCreateTest for cluster %s", c.Name)
 	clientset, err := GetAndVerifyDownstreamClientset(clients, c)
 	if err != nil {
 		t.Fatal(err)
@@ -79,6 +80,7 @@ func RunSnapshotCreateTest(t *testing.T, clients *clients.Clients, c *v1.Cluster
 	}
 
 	// Create an etcd snapshot
+	logrus.Infof(" === Create an etcd snapshot for cluster %s", c.Name)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		newC, err := clients.Provisioning.Cluster().Get(c.Namespace, c.Name, metav1.GetOptions{})
 		if err != nil {
@@ -136,6 +138,7 @@ func RunSnapshotCreateTest(t *testing.T, clients *clients.Clients, c *v1.Cluster
 	snapshotsValidTime := time.Now()
 
 	// Create a second etcd snapshot
+	logrus.Infof(" === Create 2nd etcd snapshot for cluster %s", c.Name)
 	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		newC, err := clients.Provisioning.Cluster().Get(c.Namespace, c.Name, metav1.GetOptions{})
 		if err != nil {
@@ -228,6 +231,7 @@ func RunSnapshotCreateTest(t *testing.T, clients *clients.Clients, c *v1.Cluster
 	assert.NotNil(t, snapshot)
 	assert.NotEqual(t, "failed", strings.ToLower(snapshot.SnapshotFile.Status))
 
+	logrus.Infof(" === deleting the configMap in cluster %s", c.Name)
 	err = clientset.CoreV1().ConfigMaps(ns).Delete(context.TODO(), configMap.Name, metav1.DeleteOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -240,6 +244,7 @@ func RunSnapshotCreateTest(t *testing.T, clients *clients.Clients, c *v1.Cluster
 
 	// The client will return a configmap object but it will not have anything populated.
 	assert.Equal(t, "", newCM.Name)
+	logrus.Infof("RunSnapshotCreateTest passed for cluster %s", c.Name)
 	return snapshot
 }
 
@@ -254,6 +259,7 @@ func RunSnapshotRestoreTest(t *testing.T, clients *clients.Clients, c *v1.Cluste
 		}
 	}()
 
+	logrus.Infof("run RunSnapshotRestoreTest test for cluster %s", c.Name)
 	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		newC, err := clients.Provisioning.Cluster().Get(c.Namespace, c.Name, metav1.GetOptions{})
 		if err != nil {
@@ -299,6 +305,7 @@ func RunSnapshotRestoreTest(t *testing.T, clients *clients.Clients, c *v1.Cluste
 	}
 
 	// Check for the configmap!
+	logrus.Infof("=== checking configmap")
 	retrievedConfigMap, err := clientset.CoreV1().ConfigMaps(ns).Get(context.TODO(), expectedConfigMap.Name, metav1.GetOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -307,6 +314,7 @@ func RunSnapshotRestoreTest(t *testing.T, clients *clients.Clients, c *v1.Cluste
 	assert.Equal(t, expectedConfigMap.Name, retrievedConfigMap.Name)
 	assert.Equal(t, expectedConfigMap.Data, retrievedConfigMap.Data)
 
+	logrus.Infof("=== checking nodes")
 	allNodes, err := clientset.CoreV1().Nodes().List(context.TODO(), metav1.ListOptions{})
 	if err != nil {
 		t.Fatal(err)
@@ -320,4 +328,5 @@ func RunSnapshotRestoreTest(t *testing.T, clients *clients.Clients, c *v1.Cluste
 		}
 	}
 	assert.Equal(t, expectedNodeCount, nonDeletingNodes)
+	logrus.Infof("RunSnapshotRestoreTest passed for cluster %s", c.Name)
 }
