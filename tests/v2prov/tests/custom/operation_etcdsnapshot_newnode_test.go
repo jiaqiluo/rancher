@@ -102,6 +102,24 @@ func Test_Operation_SetB_Custom_EtcdSnapshotOperationsOnNewNode(t *testing.T) {
 	snapshot := operations.RunSnapshotCreateTest(t, clients, c, cm, "etcd-test-node")
 	assert.NotNil(t, snapshot)
 
+	// patch the machine with annotations
+	etcdmachines, err := clients.CAPI.Machine().List(c.Namespace, metav1.ListOptions{LabelSelector: capr.EtcdRoleLabel + "=true"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range etcdmachines.Items {
+		machine := item.DeepCopy()
+		if machine.Annotations == nil {
+			machine.Annotations = map[string]string{}
+		}
+		machine.Annotations[capi.ExcludeNodeDrainingAnnotation] = "true"
+		machine.Annotations[capi.ExcludeWaitForNodeVolumeDetachAnnotation] = "true"
+		_, err = clients.CAPI.Machine().Update(machine)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
 	err = clients.Core.Pod().Delete(c.Namespace, etcdNodePodName, &metav1.DeleteOptions{PropagationPolicy: &[]metav1.DeletionPropagation{metav1.DeletePropagationForeground}[0]})
 	if err != nil {
 		t.Fatal(err)
