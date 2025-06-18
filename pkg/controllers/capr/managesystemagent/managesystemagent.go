@@ -89,7 +89,7 @@ func Register(ctx context.Context, clients *wrangler.Context) {
 	}
 
 	clients.Provisioning.Cluster().OnChange(ctx, "uninstall-fleet-managed-suc-and-system-agent", h.UninstallFleetBasedApps)
-	clients.Provisioning.Cluster().OnChange(ctx, "install-system-agent", h.InstallSystemAgentUpgrader)
+	clients.Provisioning.Cluster().OnChange(ctx, "install-system-agent-upgrader", h.InstallSystemAgentUpgrader)
 
 }
 
