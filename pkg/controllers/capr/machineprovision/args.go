@@ -41,7 +41,8 @@ const (
 )
 
 var (
-	regExHyphen     = regexp.MustCompile("([a-z])([A-Z])")
+	// we need to handle the case ipv6AddressCount -> ipv6-address-count
+	regExHyphen     = regexp.MustCompile("([a-z0-9])([A-Z])")
 	envNameOverride = map[string]string{
 		"amazonec2":       "AWS",
 		"rackspace":       "OS",

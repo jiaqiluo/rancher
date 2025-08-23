@@ -356,12 +356,35 @@ func addToken(config map[string]interface{}, entry *planEntry, tokensSecret plan
 }
 
 func addAddresses(secrets corecontrollers.SecretCache, config map[string]interface{}, entry *planEntry) error {
-	internalIPAddress := entry.Metadata.Annotations[capr.InternalAddressAnnotation]
-	ipAddress := entry.Metadata.Annotations[capr.AddressAnnotation]
-	internalAddressProvided, addressProvided := internalIPAddress != "", ipAddress != ""
+	// Helpers
+	firstNonEmpty := func(a, b string) string {
+		if a != "" {
+			return a
+		}
+		return b
+	}
+	appendNonEmptyUnique := func(m map[string]interface{}, key, val string) {
+		if val == "" {
+			return
+		}
+		cur := convert.ToStringSlice(m[key])
+		for _, existing := range cur {
+			if existing == val {
+				return
+			}
+		}
+		m[key] = append(cur, val)
+	}
+
+	internalIP := entry.Metadata.Annotations[capr.InternalAddressAnnotation]
+	ip := entry.Metadata.Annotations[capr.AddressAnnotation]
+	internalProvided := internalIP != ""
+	ipProvided := ip != ""
+
+	var ipv6 string
 
 	// If this is a provisioned node (not a custom node), then get the IP addresses from the machine driver config.
-	if entry.Machine.Spec.InfrastructureRef.APIVersion == capr.RKEMachineAPIVersion && (!internalAddressProvided || !addressProvided) {
+	if entry.Machine.Spec.InfrastructureRef.APIVersion == capr.RKEMachineAPIVersion && (!internalProvided || !ipProvided) {
 		secret, err := secrets.Get(entry.Machine.Spec.InfrastructureRef.Namespace, capr.MachineStateSecretName(entry.Machine.Spec.InfrastructureRef.Name))
 		if apierrors.IsNotFound(err) || (secret != nil && len(secret.Data["extractedConfig"]) == 0) {
 			return errIgnore(fmt.Sprintf("waiting for machine %s/%s driver config to be saved", entry.Machine.Namespace, entry.Machine.Name))
@@ -370,32 +393,40 @@ func addAddresses(secrets corecontrollers.SecretCache, config map[string]interfa
 		}
 
 		driverConfig, err := nodeconfig.ExtractConfigJSON(base64.StdEncoding.EncodeToString(secret.Data["extractedConfig"]))
-		if err != nil || len(driverConfig) == 0 {
+		if err != nil {
 			return fmt.Errorf("error getting machine state JSON for machine %s/%s: %w", entry.Machine.Namespace, entry.Machine.Name, err)
 		}
+		if len(driverConfig) == 0 {
+			return fmt.Errorf("machine state JSON is empty for machine %s/%s", entry.Machine.Namespace, entry.Machine.Name)
+		}
 
-		if !addressProvided {
-			ipAddress = convert.ToString(values.GetValueN(driverConfig, "Driver", "IPAddress"))
+		if !ipProvided {
+			ip = convert.ToString(values.GetValueN(driverConfig, "Driver", "IPAddress"))
 		}
-		if !internalAddressProvided {
-			internalIPAddress = convert.ToString(values.GetValueN(driverConfig, "Driver", "PrivateIPAddress"))
+		if !internalProvided {
+			internalIP = convert.ToString(values.GetValueN(driverConfig, "Driver", "PrivateIPAddress"))
 		}
+		ipv6 = convert.ToString(values.GetValueN(driverConfig, "Driver", "IPv6Address"))
 	}
 
-	setNodeExternalIP := ipAddress != "" && internalIPAddress != "" && ipAddress != internalIPAddress
+	// Prefer user-provided address or the IPv4 address from rancher-machine for "external", fall back to IPv6
+	externalIP := firstNonEmpty(ip, ipv6)
+	setNodeExternalIP := externalIP != "" && internalIP != "" && externalIP != internalIP
 
+	// on control-plane nodes with distinct internal/external, advertise the internal
 	if setNodeExternalIP && !isOnlyWorker(entry) {
-		config["advertise-address"] = internalIPAddress
-		config["tls-san"] = append(convert.ToStringSlice(config["tls-san"]), ipAddress)
+		config["advertise-address"] = internalIP
 	}
 
-	if internalIPAddress != "" {
-		config["node-ip"] = append(convert.ToStringSlice(config["node-ip"]), internalIPAddress)
-	}
+	// Always add internal node IP if known.
+	appendNonEmptyUnique(config, "node-ip", internalIP)
+	appendNonEmptyUnique(config, "node-ip", ipv6)
 
 	// Cloud provider, if set, will handle external IP
-	if convert.ToString(config["cloud-provider-name"]) == "" && (addressProvided || setNodeExternalIP) {
-		config["node-external-ip"] = append(convert.ToStringSlice(config["node-external-ip"]), ipAddress)
+	// If no cloud provider manages external IPs, set node-external-ip when appropriate.
+	if convert.ToString(config["cloud-provider-name"]) == "" && (ipProvided || setNodeExternalIP) {
+		appendNonEmptyUnique(config, "node-external-ip", ip)
+		appendNonEmptyUnique(config, "node-external-ip", ipv6)
 	}
 
 	return nil
