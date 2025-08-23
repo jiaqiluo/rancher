@@ -356,9 +356,31 @@ func addToken(config map[string]interface{}, entry *planEntry, tokensSecret plan
 }
 
 func addAddresses(secrets corecontrollers.SecretCache, config map[string]interface{}, entry *planEntry) error {
+	// Helpers
+	firstNonEmpty := func(a, b string) string {
+		if a != "" {
+			return a
+		}
+		return b
+	}
+	appendNonEmptyUnique := func(m map[string]interface{}, key, val string) {
+		if val == "" {
+			return
+		}
+		cur := convert.ToStringSlice(m[key])
+		for _, existing := range cur {
+			if existing == val {
+				return
+			}
+		}
+		m[key] = append(cur, val)
+	}
+
 	internalIPAddress := entry.Metadata.Annotations[capr.InternalAddressAnnotation]
 	ipAddress := entry.Metadata.Annotations[capr.AddressAnnotation]
 	internalAddressProvided, addressProvided := internalIPAddress != "", ipAddress != ""
+
+	var ipv6 string
 
 	// If this is a provisioned node (not a custom node), then get the IP addresses from the machine driver config.
 	if entry.Machine.Spec.InfrastructureRef.APIVersion == capr.RKEMachineAPIVersion && (!internalAddressProvided || !addressProvided) {
@@ -370,8 +392,11 @@ func addAddresses(secrets corecontrollers.SecretCache, config map[string]interfa
 		}
 
 		driverConfig, err := nodeconfig.ExtractConfigJSON(base64.StdEncoding.EncodeToString(secret.Data["extractedConfig"]))
-		if err != nil || len(driverConfig) == 0 {
+		if err != nil {
 			return fmt.Errorf("error getting machine state JSON for machine %s/%s: %w", entry.Machine.Namespace, entry.Machine.Name, err)
+		}
+		if len(driverConfig) == 0 {
+			return fmt.Errorf("machine state JSON is empty for machine %s/%s", entry.Machine.Namespace, entry.Machine.Name)
 		}
 
 		if !addressProvided {
@@ -380,22 +405,32 @@ func addAddresses(secrets corecontrollers.SecretCache, config map[string]interfa
 		if !internalAddressProvided {
 			internalIPAddress = convert.ToString(values.GetValueN(driverConfig, "Driver", "PrivateIPAddress"))
 		}
+		ipv6 = convert.ToString(values.GetValueN(driverConfig, "Driver", "IPv6Address"))
 	}
 
-	setNodeExternalIP := ipAddress != "" && internalIPAddress != "" && ipAddress != internalIPAddress
+	// Prefer user-provided address or the IPv4 address from rancher-machine for "external", fall back to IPv6
+	externalIP := firstNonEmpty(ipAddress, ipv6)
+	setNodeExternalIP := externalIP != "" && internalIPAddress != "" && externalIP != internalIPAddress
 
+	// on control-plane nodes with distinct internal/external, advertise the internal
 	if setNodeExternalIP && !isOnlyWorker(entry) {
 		config["advertise-address"] = internalIPAddress
 		config["tls-san"] = append(convert.ToStringSlice(config["tls-san"]), ipAddress)
 	}
 
-	if internalIPAddress != "" {
-		config["node-ip"] = append(convert.ToStringSlice(config["node-ip"]), internalIPAddress)
-	}
+	// Always add internal node IP when available
+	// In IPv6-only clusters, the IPv6 address should be used as both the internal and external node IP
+	appendNonEmptyUnique(config, "node-ip", internalIPAddress)
+	appendNonEmptyUnique(config, "node-ip", ipv6)
 
 	// Cloud provider, if set, will handle external IP
-	if convert.ToString(config["cloud-provider-name"]) == "" && (addressProvided || setNodeExternalIP) {
-		config["node-external-ip"] = append(convert.ToStringSlice(config["node-external-ip"]), ipAddress)
+	// If no cloud provider is set, assign node-external-ip in any of the following cases:
+	// - a public IP is available
+	// - both public and private IPs are available and differ
+	// - an IPv6 address is available (for IPv6-only clusters)
+	if convert.ToString(config["cloud-provider-name"]) == "" && (addressProvided || setNodeExternalIP || ipv6 != "") {
+		appendNonEmptyUnique(config, "node-external-ip", ipAddress)
+		appendNonEmptyUnique(config, "node-external-ip", ipv6)
 	}
 
 	return nil

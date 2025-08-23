@@ -199,7 +199,13 @@ func insertDataDirForProbes(controlPlane *rkev1.RKEControlPlane, probes map[stri
 func replaceURLForProbes(probes map[string]plan.Probe, loopbackAddress string) map[string]plan.Probe {
 	result := make(map[string]plan.Probe, len(probes))
 	for k, v := range probes {
-		v.HTTPGetAction.URL = replaceIfFormatSpecifier(v.HTTPGetAction.URL, loopbackAddress)
+		targetHost := loopbackAddress
+		// to work around the bug where Calico Healthcheck endpoint doesn't recognize the healthHost value `::1`
+		// For details, see https://github.com/projectcalico/calico/issues/10972
+		if k == "calico" && loopbackAddress == "[::1]" {
+			targetHost = "127.0.0.1"
+		}
+		v.HTTPGetAction.URL = replaceIfFormatSpecifier(v.HTTPGetAction.URL, targetHost)
 		result[k] = v
 	}
 	return result
