@@ -7,9 +7,9 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"path/filepath"
 	"time"
@@ -82,7 +82,15 @@ func (s *sshClient) shell(apiRequest *types.APIRequest) error {
 		return err
 	}
 
-	addr := fmt.Sprintf("%s:%d", machineInfo.Driver.IPAddress, machineInfo.Driver.SSHPort)
+	address := machineInfo.Driver.IPAddress
+	if address == "" {
+		address = machineInfo.Driver.IPv6Address
+	}
+	if address == "" {
+		return errors.New("could not determine machine address")
+	}
+
+	addr := fmt.Sprintf("%s:%d", address, machineInfo.Driver.SSHPort)
 	client, err := ssh.Dial("tcp", addr, &ssh.ClientConfig{
 		User: machineInfo.Driver.SSHUser,
 		Auth: []ssh.AuthMethod{
@@ -170,6 +178,7 @@ type machineInfo struct {
 
 type machineConfig struct {
 	IPAddress   string
+	IPv6Address string
 	SSHUser     string
 	SSHPort     int
 	MachineName string
@@ -203,7 +212,7 @@ func (s *sshClient) getSSHKey(machineNamespace, machineName string) (*machineInf
 			return nil, err
 		}
 
-		data, err := ioutil.ReadAll(tar)
+		data, err := io.ReadAll(tar)
 		if err != nil {
 			return nil, err
 		}
