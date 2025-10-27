@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"hash"
+	"net"
 	"path"
 	"slices"
 	"sort"
@@ -33,6 +34,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
+	netutils "k8s.io/utils/net"
 )
 
 // addEtcd mutates the given config map with etcd-specific configuration elements, and adds S3-related arguments and files if renderS3 is true.
@@ -357,13 +359,63 @@ func addToken(config map[string]interface{}, entry *planEntry, tokensSecret plan
 	}
 }
 
+// getStack determines the networking stack ("ipv4", "ipv6", "dual-stack") of the cluster
+// by parsing the "cluster-cidr" value from the configuration. It also returns the primary
+// stack, which is determined by the first CIDR in the list.
+// It defaults to "ipv4" for both if the CIDR is not specified.
+func getStack(config map[string]interface{}) (string, string, error) {
+	clusterCidr := strings.TrimSpace(convert.ToString(config["cluster-cidr"]))
+	var cidrs []*net.IPNet
+	for _, p := range strings.Split(clusterCidr, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		// Use ParseCIDRSloppy for better compatibility with values that might have leading zeros.
+		_, parsed, err := netutils.ParseCIDRSloppy(p)
+		if err != nil {
+			return "", "", fmt.Errorf("invalid CIDR %s in cluster-cidr: %w", p, err)
+		}
+		cidrs = append(cidrs, parsed)
+	}
+
+	switch len(cidrs) {
+	case 0:
+		return "ipv4", "ipv4", nil
+	case 1:
+		if netutils.IsIPv4CIDR(cidrs[0]) {
+			return "ipv4", "ipv4", nil
+		}
+		if netutils.IsIPv6CIDR(cidrs[0]) {
+			return "ipv6", "ipv6", nil
+		}
+		return "", "", fmt.Errorf("invalid ipv4 or ipv6 cluster cidr: %s", clusterCidr)
+	case 2:
+		if isDual, _ := netutils.IsDualStackCIDRs(cidrs); isDual {
+			primaryStack := "ipv4"
+			if netutils.IsIPv6CIDR(cidrs[0]) {
+				primaryStack = "ipv6"
+			}
+			return "dual-stack", primaryStack, nil
+		}
+		return "", "", fmt.Errorf("invalid dual-stack cluster cidr: %s", clusterCidr)
+	default:
+		return "", "", fmt.Errorf("invalid cluster cidr: %s", clusterCidr)
+	}
+}
+
 func addAddresses(secrets corecontrollers.SecretCache, config map[string]interface{}, entry *planEntry) error {
 	info, err := getMachineNetworkInfo(secrets, entry)
 	if err != nil {
-		return err
+		return fmt.Errorf("[planner] error getting machine network info: %w", err)
 	}
 
-	updateConfigWithAddresses(config, info)
+	ClusterStack, primiaryStack, err := getStack(config)
+	if err != nil {
+		return fmt.Errorf("[planner] error getting cluster networking stack: %w", err)
+	}
+
+	updateConfigWithAddresses(config, info, ClusterStack, primiaryStack)
 	return nil
 }
 
@@ -437,10 +489,27 @@ func getMachineNetworkInfo(secrets corecontrollers.SecretCache, entry *planEntry
 	return info, nil
 }
 
-// updateConfigWithAddresses mutates the node configuration map based on the provided network information.
-// As long as Rancher sets the node-ip and node-external-ip properly, RKE2/K3s will automatically
-// determine the appropriate advertise-address and tls-san values.
-func updateConfigWithAddresses(config map[string]interface{}, info *machineNetworkInfo) {
+// filterIPsByFamily separates a slice of IP address strings into IPv4 and IPv6 slices.
+func filterIPsByFamily(ips []string) (ipv4s, ipv6s []string) {
+	ipv4s = make([]string, 0)
+	ipv6s = make([]string, 0)
+	for _, ip := range ips {
+		if netutils.IsIPv4String(ip) {
+			ipv4s = append(ipv4s, ip)
+		} else if netutils.IsIPv6String(ip) {
+			ipv6s = append(ipv6s, ip)
+		}
+	}
+	return
+}
+
+// updateConfigWithAddresses updates the node configuration map by setting `node-ip` and `node-external-ip`
+// based on the machine's network addresses and the cluster's networking configuration. It prefers internal
+// IPs for `node-ip` and chooses addresses that align with the specified `clusterStack` ("ipv4", "ipv6", or
+// "dual-stack"). The `node-external-ip` is selected according to the `primaryStack`. The function also
+// includes special handling for specific machine drivers. These settings enable RKE2/K3s to automatically
+// determine the correct advertise-address and tls-san values.
+func updateConfigWithAddresses(config map[string]interface{}, info *machineNetworkInfo, clusterStack, primiaryStack string) {
 	nodeIPs := convert.ToStringSlice(config["node-ip"])
 	var toAdd []string
 
@@ -452,11 +521,12 @@ func updateConfigWithAddresses(config map[string]interface{}, info *machineNetwo
 		return
 
 	case management.DigitalOceandriver:
-		// The public IPv4 address cannot be disabled. Therefore, if --private-network is not enabled, the public IPv4
-		// address needs to be set to the node-ip to maintain alignment with cluster-cidr and server-cidr in dual-stack mode.
-		// This also implies that an IPv6-only DO node driver cluster is not possible.
-		toAdd = info.InternalAddresses
-		if len(toAdd) == 0 {
+		// The public IPv4 address cannot be disabled, so the ExternalAddresses always exists.
+		// If private networking is enabled, InternalAddresses will be populated and should be preferred.
+		// Otherwise, fall back to the public IP for node-ip.
+		if len(info.InternalAddresses) > 0 {
+			toAdd = info.InternalAddresses
+		} else {
 			toAdd = info.ExternalAddresses
 		}
 
@@ -465,16 +535,23 @@ func updateConfigWithAddresses(config map[string]interface{}, info *machineNetwo
 		toAdd = info.InternalAddresses
 	}
 
-	if len(toAdd) > 0 {
-		for _, ip := range toAdd {
-			if ip != "" && !slices.Contains(nodeIPs, ip) {
-				nodeIPs = append(nodeIPs, ip)
-			}
-		}
+	ipv4s, ipv6s := filterIPsByFamily(toAdd)
+	if info.IPv6Address != "" {
+		ipv6s = append(ipv6s, info.IPv6Address)
 	}
 
-	if info.IPv6Address != "" && !slices.Contains(nodeIPs, info.IPv6Address) {
-		nodeIPs = append(nodeIPs, info.IPv6Address)
+	var selectedIPs []string
+	if clusterStack == "ipv4" || clusterStack == "dual-stack" {
+		selectedIPs = append(selectedIPs, ipv4s...)
+	}
+	if clusterStack == "ipv6" || clusterStack == "dual-stack" {
+		selectedIPs = append(selectedIPs, ipv6s...)
+	}
+
+	for _, ip := range selectedIPs {
+		if !slices.Contains(nodeIPs, ip) {
+			nodeIPs = append(nodeIPs, ip)
+		}
 	}
 
 	config["node-ip"] = nodeIPs
@@ -484,7 +561,25 @@ func updateConfigWithAddresses(config map[string]interface{}, info *machineNetwo
 	// and have not already been assigned to node-ip.
 	if convert.ToString(config["cloud-provider-name"]) == "" {
 		nodeExternalIPs := convert.ToStringSlice(config["node-external-ip"])
-		for _, ip := range info.ExternalAddresses {
+		externalIPv4s, externalIPv6s := filterIPsByFamily(info.ExternalAddresses)
+
+		var externalIPsToAdd []string
+		if clusterStack == "ipv4" {
+			externalIPsToAdd = append(externalIPsToAdd, externalIPv4s...)
+		}
+		if clusterStack == "ipv6" {
+			externalIPsToAdd = append(externalIPsToAdd, externalIPv6s...)
+		}
+		if clusterStack == "dual-stack" {
+			if primiaryStack == "ipv4" && len(externalIPv4s) > 0 {
+				externalIPsToAdd = append(externalIPv4s, externalIPv6s...)
+			}
+			if primiaryStack == "ipv6" && len(externalIPv6s) > 0 {
+				externalIPsToAdd = append(externalIPv6s, externalIPv4s...)
+			}
+		}
+
+		for _, ip := range externalIPsToAdd {
 			if ip != "" && !slices.Contains(nodeExternalIPs, ip) && !slices.Contains(nodeIPs, ip) {
 				nodeExternalIPs = append(nodeExternalIPs, ip)
 			}
