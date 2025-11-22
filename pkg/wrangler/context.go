@@ -86,7 +86,7 @@ import (
 	"k8s.io/client-go/restmapper"
 	"k8s.io/client-go/tools/clientcmd"
 	apiregistrationv12 "k8s.io/kube-aggregator/pkg/apis/apiregistration/v1"
-	capiv1beta1api "sigs.k8s.io/cluster-api/api/core/v1beta1"
+	capiv1beta1api "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
 var (

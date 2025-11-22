@@ -77,7 +77,7 @@ func (h *handler) associateMachineWithNode(_ string, bootstrap *rkev1.RKEBootstr
 		return bootstrap, err
 	}
 
-	if machine.Spec.ProviderID != nil && *machine.Spec.ProviderID != "" {
+	if machine.Spec.ProviderID != "" {
 		// If the machine already has its provider ID set, then we do not need to continue
 		return bootstrap, nil
 	}

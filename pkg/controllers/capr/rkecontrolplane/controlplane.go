@@ -21,7 +21,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
-	capi "sigs.k8s.io/cluster-api/api/core/v1beta1"
+	capi "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
 func Register(ctx context.Context, clients *wrangler.CAPIContext) {
@@ -122,7 +122,7 @@ func (h *handler) doRemove(cp *rkev1.RKEControlPlane) func() (string, error) {
 
 		for _, machine := range allMachines {
 			// Only delete custom machines. Custom machines can be added outside the UI, so it is important to check each machine.
-			if machine.Spec.InfrastructureRef.APIVersion != "rke.cattle.io/v1" || machine.Spec.InfrastructureRef.Kind != "CustomMachine" {
+			if machine.Spec.InfrastructureRef.APIGroup != capr.RKEAPIGroup || machine.Spec.InfrastructureRef.Kind != "CustomMachine" {
 				continue
 			}
 			if machine.DeletionTimestamp == nil {
