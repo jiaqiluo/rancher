@@ -39,7 +39,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
-	capi "sigs.k8s.io/cluster-api/api/core/v1beta1"
+	capi "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	capierrors "sigs.k8s.io/cluster-api/errors"
 )
 
@@ -101,8 +101,13 @@ const (
 	WindowsMachineOS = "windows"
 
 	DefaultMachineConfigAPIVersion = "rke-machine-config.cattle.io/v1"
-	RKEMachineAPIVersion           = "rke-machine.cattle.io/v1"
-	RKEAPIVersion                  = "rke.cattle.io/v1"
+
+	// RKEMachineAPIGroup contains kinds for rancher-provisioned, aka node-driver, machine and machineTemplate
+	RKEMachineAPIGroup   = "rke-machine.cattle.io"
+	RKEMachineAPIVersion = "rke-machine.cattle.io/v1"
+
+	RKEAPIGroup   = "rke.cattle.io"
+	RKEAPIVersion = "rke.cattle.io/v1"
 
 	Provisioned                  = condition.Cond("Provisioned")
 	Stable                       = condition.Cond("Stable") // The Stable condition is used to indicate whether we can safely copy the v3 management cluster Ready condition to the v1 object.
@@ -413,7 +418,8 @@ func GetMachineDeletionStatus(machines []*capi.Machine) (string, error) {
 		return machines[i].Name < machines[j].Name
 	})
 	for _, machine := range machines {
-		if machine.Status.FailureReason != nil && *machine.Status.FailureReason == capierrors.DeleteMachineError {
+		//  TODO: replace the usage of those two fields
+		if machine.Status.Deprecated.V1Beta1.FailureReason != nil && *machine.Status.Deprecated.V1Beta1.FailureReason == capierrors.DeleteMachineError {
 			return "", fmt.Errorf("error deleting machine [%s], machine must be deleted manually", machine.Name)
 		}
 		return fmt.Sprintf("waiting for machine [%s] to delete", machine.Name), nil
