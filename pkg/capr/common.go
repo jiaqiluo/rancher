@@ -40,7 +40,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/kubernetes"
 	capi "sigs.k8s.io/cluster-api/api/core/v1beta2"
-	capierrors "sigs.k8s.io/cluster-api/errors"
+	"sigs.k8s.io/cluster-api/util/conditions"
 )
 
 const (
@@ -418,10 +418,14 @@ func GetMachineDeletionStatus(machines []*capi.Machine) (string, error) {
 		return machines[i].Name < machines[j].Name
 	})
 	for _, machine := range machines {
-		//  TODO: replace the usage of those two fields
-		if machine.Status.Deprecated.V1Beta1.FailureReason != nil && *machine.Status.Deprecated.V1Beta1.FailureReason == capierrors.DeleteMachineError {
+		//  TODO: Is it the correct way to replace the deprecated filed?
+		deletingCondition := conditions.Get(machine, capi.MachineDeletingCondition)
+		if deletingCondition != nil && deletingCondition.Status == metav1.ConditionFalse {
 			return "", fmt.Errorf("error deleting machine [%s], machine must be deleted manually", machine.Name)
 		}
+		// if machine.Status.Deprecated.V1Beta1.FailureReason != nil && *machine.Status.Deprecated.V1Beta1.FailureReason == capierrors.DeleteMachineError {
+		// 	return "", fmt.Errorf("error deleting machine [%s], machine must be deleted manually", machine.Name)
+		// }
 		return fmt.Sprintf("waiting for machine [%s] to delete", machine.Name), nil
 	}
 
