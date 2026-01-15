@@ -18,7 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	capi "sigs.k8s.io/cluster-api/api/v1beta1"
+	capi "sigs.k8s.io/cluster-api/api/core/v1beta2"
 	capierrors "sigs.k8s.io/cluster-api/errors"
 )
 
@@ -379,7 +379,7 @@ func TestOnChange(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			settings.DeleteMachineOnFailureAfter.Set(tc.setting)
+			_ = settings.DeleteMachineOnFailureAfter.Set(tc.setting)
 
 			dynamicControllerFake := dynamicControllerFake{}
 			h.dynamic = &dynamicControllerFake
@@ -413,8 +413,10 @@ func newCapiMachine(name, namespace string) *capi.Machine {
 		},
 		Spec: capi.MachineSpec{
 			Bootstrap: capi.Bootstrap{
-				ConfigRef: &corev1.ObjectReference{
-					APIVersion: "v1",
+				ConfigRef: capi.ContractVersionedObjectReference{
+					Kind:     "",
+					Name:     "",
+					APIGroup: "",
 				},
 				DataSecretName: &dataSecretName,
 			},
@@ -435,10 +437,8 @@ func newCluster(name, namespace string) *capi.Cluster {
 				capi.ClusterNameLabel: name,
 			},
 		},
-		Spec: capi.ClusterSpec{},
-		Status: capi.ClusterStatus{
-			InfrastructureReady: true,
-		},
+		Spec:   capi.ClusterSpec{},
+		Status: capi.ClusterStatus{},
 	}
 }
 func newJob(ctrl *gomock.Controller, t time.Time) *ctrlfake.MockCacheInterface[*batchv1.Job] {
@@ -485,7 +485,7 @@ func newInfra(jobName string) *infraObject {
 // newTestInfraMachine creates an object that will be translated to a infraMachine on the OnChange function
 func newTestInfraMachine(withFailure bool) *unstructured.Unstructured {
 	objectData := map[string]interface{}{
-		"apiVersion": "infrastructure.cluster.x-k8s.io/v1beta1",
+		"apiVersion": "infrastructure.cluster.x-k8s.io/v1beta2",
 		"kind":       "InfraMachine",
 		"metadata": map[string]interface{}{
 			"namespace": "namespace",

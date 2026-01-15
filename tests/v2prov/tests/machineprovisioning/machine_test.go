@@ -30,7 +30,7 @@ import (
 	k8swait "k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 	"k8s.io/utils/ptr"
-	capi "sigs.k8s.io/cluster-api/api/v1beta1"
+	capi "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
 func Test_Provisioning_MP_SingleNodeAllRolesWithDelete(t *testing.T) {
@@ -790,7 +790,7 @@ func Test_Provisioning_Single_Node_All_Roles_Drain(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		m, err := clients.CAPI.Machine().Get(c.Namespace, secondMachineName, metav1.GetOptions{})
-		if err != nil || m.Status.NodeRef == nil {
+		if err != nil || !m.Status.NodeRef.IsDefined() {
 			return false
 		}
 

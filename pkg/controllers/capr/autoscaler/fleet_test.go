@@ -8,13 +8,12 @@ import (
 	"github.com/rancher/rancher/pkg/buildconfig"
 	"github.com/rancher/rancher/pkg/settings"
 	"go.uber.org/mock/gomock"
-	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	capi "sigs.k8s.io/cluster-api/api/v1beta1"
+	capi "sigs.k8s.io/cluster-api/api/core/v1beta2"
 )
 
 // Test cases for ensureFleetHelmOp method
@@ -155,18 +154,17 @@ func (s *autoscalerSuite) TestResolveImageTagVersion_HappyPath_KnownVersion() {
 			Namespace: "default",
 		},
 		Spec: capi.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: "rke.cattle.io/v1",
-				Kind:       "RKEControlPlane",
-				Name:       "test-control-plane",
-				Namespace:  "default",
+			ControlPlaneRef: capi.ContractVersionedObjectReference{
+				APIGroup: "rke.cattle.io",
+				Kind:     "RKEControlPlane",
+				Name:     "test-control-plane",
 			},
 		},
 	}
 
 	s.dynamicClient.SetGetFunc(func(gvk schema.GroupVersionKind, namespace string, name string) (runtime.Object, error) {
 		// Only return the RKEControlPlane if the GVK matches what we expect for RKEControlPlane
-		if gvk.Group == "rke.cattle.io" && gvk.Version == "v1" && gvk.Kind == "RKEControlPlane" {
+		if gvk.Group == "rke.cattle.io" && gvk.Kind == "RKEControlPlane" {
 			return rkeCP, nil
 		}
 		return nil, fmt.Errorf("not found")
@@ -214,8 +212,10 @@ func (s *autoscalerSuite) TestGetChartImageSettings_HappyPath_NoOverride() {
 
 func (s *autoscalerSuite) TestGetChartImageSettings_HappyPath_WithValidImage() {
 	originalImage := settings.ClusterAutoscalerImage.Get()
-	defer settings.ClusterAutoscalerImage.Set(originalImage)
-	settings.ClusterAutoscalerImage.Set("registry.example.com/cluster-autoscaler:1.2.3")
+	defer func() {
+		_ = settings.ClusterAutoscalerImage.Set(originalImage)
+	}()
+	_ = settings.ClusterAutoscalerImage.Set("registry.example.com/cluster-autoscaler:1.2.3")
 
 	cluster := &capi.Cluster{
 		ObjectMeta: metav1.ObjectMeta{
@@ -242,11 +242,10 @@ func (s *autoscalerSuite) TestGetKubernetesMinorVersion_HappyPath_RKEControlPlan
 			Namespace: "default",
 		},
 		Spec: capi.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: "rke.cattle.io/v1",
-				Kind:       "RKEControlPlane",
-				Name:       "test-control-plane",
-				Namespace:  "default",
+			ControlPlaneRef: capi.ContractVersionedObjectReference{
+				APIGroup: "rke.cattle.io",
+				Kind:     "RKEControlPlane",
+				Name:     "test-control-plane",
 			},
 		},
 	}
@@ -267,7 +266,7 @@ func (s *autoscalerSuite) TestGetKubernetesMinorVersion_HappyPath_RKEControlPlan
 
 	s.dynamicClient.SetGetFunc(func(gvk schema.GroupVersionKind, namespace string, name string) (runtime.Object, error) {
 		// Only return the RKEControlPlane if the GVK matches what we expect for RKEControlPlane
-		if gvk.Group == "rke.cattle.io" && gvk.Version == "v1" && gvk.Kind == "RKEControlPlane" {
+		if gvk.Group == "rke.cattle.io" && gvk.Kind == "RKEControlPlane" {
 			return rkeCP, nil
 		}
 		return nil, fmt.Errorf("not found")
@@ -284,11 +283,10 @@ func (s *autoscalerSuite) TestGetKubernetesMinorVersion_HappyPath_CAPIControlPla
 			Namespace: "default",
 		},
 		Spec: capi.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: "controlplane.cluster.x-k8s.io/v1beta1",
-				Kind:       "KubeadmControlPlane",
-				Name:       "test-control-plane",
-				Namespace:  "default",
+			ControlPlaneRef: capi.ContractVersionedObjectReference{
+				APIGroup: "controlplane.cluster.x-k8s.io",
+				Kind:     "KubeadmControlPlane",
+				Name:     "test-control-plane",
 			},
 		},
 	}
@@ -303,7 +301,7 @@ func (s *autoscalerSuite) TestGetKubernetesMinorVersion_HappyPath_CAPIControlPla
 
 	s.dynamicClient.SetGetFunc(func(gvk schema.GroupVersionKind, namespace string, name string) (runtime.Object, error) {
 		// Only return the Unstructured object if the GVK matches what we expect for CAPI control plane
-		if gvk.Group == "controlplane.cluster.x-k8s.io" && gvk.Version == "v1beta1" && gvk.Kind == "KubeadmControlPlane" {
+		if gvk.Group == "controlplane.cluster.x-k8s.io" && gvk.Kind == "KubeadmControlPlane" {
 			return unstructuredCP, nil
 		}
 		return nil, fmt.Errorf("not found")
@@ -320,11 +318,10 @@ func (s *autoscalerSuite) TestGetKubernetesMinorVersion_EdgeCase_ErrorGettingCon
 			Namespace: "default",
 		},
 		Spec: capi.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: "rke.cattle.io/v1",
-				Kind:       "RKEControlPlane",
-				Name:       "non-existent",
-				Namespace:  "default",
+			ControlPlaneRef: capi.ContractVersionedObjectReference{
+				APIGroup: "rke.cattle.io",
+				Kind:     "RKEControlPlane",
+				Name:     "non-existent",
 			},
 		},
 	}
@@ -348,11 +345,10 @@ func (s *autoscalerSuite) TestGetKubernetesMinorVersion_EdgeCase_InvalidVersion(
 			Namespace: "default",
 		},
 		Spec: capi.ClusterSpec{
-			ControlPlaneRef: &corev1.ObjectReference{
-				APIVersion: "rke.cattle.io/v1",
-				Kind:       "RKEControlPlane",
-				Name:       "test-control-plane",
-				Namespace:  "default",
+			ControlPlaneRef: capi.ContractVersionedObjectReference{
+				APIGroup: "rke.cattle.io",
+				Kind:     "RKEControlPlane",
+				Name:     "test-control-plane",
 			},
 		},
 	}
@@ -386,7 +382,7 @@ func (s *autoscalerSuite) TestGetKubernetesMinorVersion_EdgeCase_NilControlPlane
 			Namespace: "default",
 		},
 		Spec: capi.ClusterSpec{
-			ControlPlaneRef: nil, // Nil control plane ref
+			ControlPlaneRef: capi.ContractVersionedObjectReference{},
 		},
 	}
 
@@ -438,7 +434,9 @@ func (s *autoscalerSuite) TestCleanupFleet_EdgeCase_DeleteError() {
 
 	err := s.h.cleanupFleet(cluster)
 	s.Error(err)
-	s.Contains(err.Error(), "failed to delete Helm operation")
+	if err != nil {
+		s.Contains(err.Error(), "failed to delete Helm operation")
+	}
 }
 
 func (s *autoscalerSuite) TestCleanupFleet_EdgeCase_GetError() {
@@ -453,7 +451,9 @@ func (s *autoscalerSuite) TestCleanupFleet_EdgeCase_GetError() {
 
 	err := s.h.cleanupFleet(cluster)
 	s.Error(err)
-	s.Contains(err.Error(), "failed to check existence of Helm operation")
+	if err != nil {
+		s.Contains(err.Error(), "failed to check existence of Helm operation")
+	}
 }
 
 // Test cases for cleanupFleet method
@@ -522,9 +522,11 @@ func (s *autoscalerSuite) TestCleanupFleet_Error_FailedToDeleteHelmOp() {
 
 	// Assert the result
 	s.Error(err, "Expected error when HelmOp deletion fails")
-	s.Contains(err.Error(), "encountered 1 errors during fleet cleanup", "Error should mention count of errors")
-	s.Contains(err.Error(), "failed to delete Helm operation "+helmOpName+" in namespace "+cluster.Namespace, "Error should include HelmOp name and namespace")
-	s.Contains(err.Error(), "access denied", "Original error should be preserved")
+	if err != nil {
+		s.Contains(err.Error(), "encountered 1 errors during fleet cleanup", "Error should mention count of errors")
+		s.Contains(err.Error(), "failed to delete Helm operation "+helmOpName+" in namespace "+cluster.Namespace, "Error should include HelmOp name and namespace")
+		s.Contains(err.Error(), "access denied", "Original error should be preserved")
+	}
 }
 
 func (s *autoscalerSuite) TestCleanupFleet_Error_FailedToCheckHelmOpExistence() {
@@ -547,9 +549,11 @@ func (s *autoscalerSuite) TestCleanupFleet_Error_FailedToCheckHelmOpExistence() 
 
 	// Assert the result
 	s.Error(err, "Expected error when HelmOp existence check fails")
-	s.Contains(err.Error(), "encountered 1 errors during fleet cleanup", "Error should mention count of errors")
-	s.Contains(err.Error(), "failed to check existence of Helm operation "+helmOpName+" in namespace "+cluster.Namespace, "Error should include HelmOp name and namespace")
-	s.Contains(err.Error(), "network timeout", "Original error should be preserved")
+	if err != nil {
+		s.Contains(err.Error(), "encountered 1 errors during fleet cleanup", "Error should mention count of errors")
+		s.Contains(err.Error(), "failed to check existence of Helm operation "+helmOpName+" in namespace "+cluster.Namespace, "Error should include HelmOp name and namespace")
+		s.Contains(err.Error(), "network timeout", "Original error should be preserved")
+	}
 }
 
 func (s *autoscalerSuite) TestCleanupFleet_EdgeCase_ClusterWithEmptyName() {
