@@ -153,25 +153,24 @@ func WaitForCreate(clients *clients.Clients, c *provisioningv1api.Cluster) (_ *p
 			err = fmt.Errorf("cluster %s creation wait failed on: %w\ncluster %s test data bundle: \n%s\n", c.Name, err, c.Name, data)
 		}
 	}()
-
-	logrus.Infof("waiting for provisioning cluster %s/%s (generation %d) to report ready", c.Namespace, c.Name, c.Generation)
+	fmt.Printf("waiting for provisioning cluster %s/%s (generation %d) to report ready\n", c.Namespace, c.Name, c.Generation)
 	err = wait.Object(clients.Ctx, clients.Provisioning.Cluster().Watch, c, func(obj runtime.Object) (bool, error) {
 		c = obj.(*provisioningv1api.Cluster)
-		logrus.Infof("current status of provisioning cluster %s/%s: clusterName=%s, ready=%t, observedGeneration=%d, generation=%d, caprReady=%t, caprProvisioned=%t", c.Namespace, c.Name, c.Status.ClusterName, c.Status.Ready, c.Status.ObservedGeneration, c.Generation, capr.Ready.IsTrue(c), capr.Provisioned.IsTrue(c))
+		fmt.Printf("current status of provisioning cluster %s/%s: clusterName=%s, ready=%t, observedGeneration=%d, generation=%d, caprReady=%t, caprProvisioned=%t\n", c.Namespace, c.Name, c.Status.ClusterName, c.Status.Ready, c.Status.ObservedGeneration, c.Generation, capr.Ready.IsTrue(c), capr.Provisioned.IsTrue(c))
 		return c.Status.ClusterName != "" && c.Status.Ready && c.Status.ObservedGeneration == c.Generation && capr.Ready.IsTrue(c) && capr.Provisioned.IsTrue(c), nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("prov cluster is not ready: %w", err)
 	}
-	logrus.Infof("provisioning cluster %s/%s is ready (clusterName=%s)", c.Namespace, c.Name, c.Status.ClusterName)
+	fmt.Printf("provisioning cluster %s/%s is ready (clusterName=%s)\n", c.Namespace, c.Name, c.Status.ClusterName)
 
 	if len(c.Spec.RKEConfig.MachinePools) > 0 {
-		logrus.Infof("waiting on machine deployments for %s/%s across %d pool(s)", c.Namespace, c.Name, len(c.Spec.RKEConfig.MachinePools))
+		fmt.Printf("waiting on machine deployments for %s/%s across %d pool(s)\n", c.Namespace, c.Name, len(c.Spec.RKEConfig.MachinePools))
 		machineSets, err := MachineSets(clients, c)
 		if err != nil {
 			return nil, err
 		}
-		logrus.Infof("found %d machinesets for cluster %s/%s", len(machineSets.Items), c.Namespace, c.Name)
+		fmt.Printf("found %d machinesets for cluster %s/%s\n", len(machineSets.Items), c.Namespace, c.Name)
 
 		for _, machineSet := range machineSets.Items {
 			// retrieve the corresponding machinedeployment and verify that it is "sane"
@@ -183,9 +182,9 @@ func WaitForCreate(clients *clients.Clients, c *provisioningv1api.Cluster) (_ *p
 			if err != nil {
 				return nil, err
 			}
-			logrus.Infof("find the machine deployment %s/%s for machineset %s/%s (pool=%s)", md.Namespace, md.Name, machineSet.Namespace, machineSet.Name, mpName)
-			logrus.Infof("%v", md)
-			logrus.Infof("waiting for MachineDeployment %s/%s (pool=%s) to become Running", md.Namespace, md.Name, mpName)
+			fmt.Printf("find the machine deployment %s/%s for machineset %s/%s (pool=%s)\n", md.Namespace, md.Name, machineSet.Namespace, machineSet.Name, mpName)
+			fmt.Printf("%v\n", md)
+			fmt.Printf("waiting for MachineDeployment %s/%s (pool=%s) to become Running\n", md.Namespace, md.Name, mpName)
 			err = wait.Object(clients.Ctx, clients.CAPI.MachineDeployment().Watch, md, func(obj runtime.Object) (bool, error) {
 				md = obj.(*capi.MachineDeployment)
 				for _, mp := range c.Spec.RKEConfig.MachinePools {
@@ -202,23 +201,23 @@ func WaitForCreate(clients *clients.Clients, c *provisioningv1api.Cluster) (_ *p
 			if err != nil {
 				return nil, fmt.Errorf("MachineDeployment %s/%s was not ready: %w", md.Namespace, md.Name, err)
 			}
-			logrus.Infof("MachineDeployment %s/%s (pool=%s) is Running", md.Namespace, md.Name, mpName)
+			fmt.Printf("MachineDeployment %s/%s (pool=%s) is Running\n", md.Namespace, md.Name, mpName)
 		}
 	}
 
-	logrus.Infof("verifying NodeRef assignment for machines in %s/%s", c.Namespace, c.Name)
+	fmt.Printf("verifying NodeRef assignment for machines in %s/%s\n", c.Namespace, c.Name)
 	machines, err := Machines(clients, c)
 	if err != nil {
 		return nil, err
 	}
 
-	logrus.Infof("found %d machines for cluster %s/%s", len(machines.Items), c.Namespace, c.Name)
+	fmt.Printf("found %d machines for cluster %s/%s\n", len(machines.Items), c.Namespace, c.Name)
 
 	for _, machine := range machines.Items {
 		if !machine.DeletionTimestamp.IsZero() {
 			continue
 		}
-		logrus.Infof("waiting for Machine %s/%s to receive NodeRef", machine.Namespace, machine.Name)
+		fmt.Printf("waiting for Machine %s/%s to receive NodeRef\n", machine.Namespace, machine.Name)
 		err = wait.Object(clients.Ctx, clients.CAPI.Machine().Watch, &machine, func(obj runtime.Object) (bool, error) {
 			machine = *obj.(*capi.Machine)
 			return machine.Status.NodeRef.IsDefined(), nil
@@ -226,7 +225,7 @@ func WaitForCreate(clients *clients.Clients, c *provisioningv1api.Cluster) (_ *p
 		if err != nil {
 			return nil, fmt.Errorf("noderef not assigned to %s/%s: %w", machine.Namespace, machine.Name, err)
 		}
-		logrus.Infof("Machine %s/%s now has NodeRef %s", machine.Namespace, machine.Name, machine.Status.NodeRef.Name)
+		fmt.Printf("Machine %s/%s now has NodeRef %s\n", machine.Namespace, machine.Name, machine.Status.NodeRef.Name)
 	}
 
 	mgmtCluster, err := clients.Mgmt.Cluster().Get(c.Status.ClusterName, metav1.GetOptions{})
@@ -234,18 +233,18 @@ func WaitForCreate(clients *clients.Clients, c *provisioningv1api.Cluster) (_ *p
 		return nil, err
 	}
 
-	logrus.Infof("waiting for management cluster %s to report Ready", c.Status.ClusterName)
+	fmt.Printf("waiting for management cluster %s to report Ready\n", c.Status.ClusterName)
 	err = wait.Object(clients.Ctx, func(namespace string, opts metav1.ListOptions) (watch.Interface, error) {
 		return clients.Mgmt.Cluster().Watch(opts)
 	}, mgmtCluster, func(obj runtime.Object) (bool, error) {
 		mgmtCluster = obj.(*v3.Cluster)
-		logrus.Infof("current status of management cluster %s: ready=%t, conditions=%v", mgmtCluster.Name, condition.Cond("Ready").IsTrue(mgmtCluster), mgmtCluster.Status.Conditions)
+		fmt.Printf("current status of management cluster %s: ready=%t, conditions=%v\n", mgmtCluster.Name, condition.Cond("Ready").IsTrue(mgmtCluster), mgmtCluster.Status.Conditions)
 		return condition.Cond("Ready").IsTrue(mgmtCluster), nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("mgmt cluster is not ready: %w", err)
 	}
-	logrus.Infof("management cluster %s is Ready", c.Status.ClusterName)
+	fmt.Printf("management cluster %s is Ready\n", c.Status.ClusterName)
 
 	return c, nil
 }
