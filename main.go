@@ -209,9 +209,6 @@ func initLogs(c *cli.Context, cfg rancher.Options) {
 		logrus.SetFormatter(&logrus.JSONFormatter{})
 	}
 	logrus.SetOutput(os.Stdout)
-	// for testing, always enable debug
-	logrus.SetLevel(logrus.DebugLevel)
-	logrus.Debugf("Loglevel set to [%v]", logrus.DebugLevel)
 	if cfg.Debug {
 		logrus.SetLevel(logrus.DebugLevel)
 		logrus.Debugf("Loglevel set to [%v]", logrus.DebugLevel)

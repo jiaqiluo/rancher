@@ -76,11 +76,9 @@ func (m *Lifecycle) Create(obj *v32.NodeDriver) (runtime.Object, error) {
 
 func (m *Lifecycle) download(obj *v32.NodeDriver) (*v32.NodeDriver, error) {
 	logrus.Debugf("Downloading node driver %s", obj.Name)
-	logrus.Debugf("Node driver %s spec: %+v", obj.Name, obj.Spec)
 	driverLock.Lock()
 	defer driverLock.Unlock()
 	if !obj.Spec.Active && !obj.Spec.AddCloudCredential {
-		logrus.Debugf("Node driver %s is not active and does not add cloud credential, skipping download", obj.Name)
 		return obj, nil
 	}
 
