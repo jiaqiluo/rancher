@@ -19,6 +19,13 @@ type OperationSpec struct {
 	// +optional
 	Paused bool `json:"paused,omitempty"`
 
+	// Cancel requests the operation stop permanently. Unlike Paused, it is terminal and cannot be unset.
+	// Recover by deleting and recreating the operation. If both Paused and Cancel are true, Cancel wins.
+	// +kubebuilder:default=false
+	// +kubebuilder:validation:XValidation:rule="self || !oldSelf",message="cancel cannot be unset once true"
+	// +optional
+	Cancel bool `json:"cancel,omitempty"`
+
 	// TTL is the time-to-live for the operation in seconds.
 	// This TTL is only enforced when the operation is not paused and has reached a terminal state.
 	// Setting a value < 0 represents +infinity, i.e. an operation which does not expire.
@@ -79,4 +86,28 @@ type OperationStatus struct {
 	// +optional
 	// +kubebuilder:validation:Minimum=1
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
+
+	// CancelRequestedAt is set once when the first reconcile observes Spec.Cancel while the operation
+	// is InProgress. It is never rewritten.
+	//
+	// It anchors the bounded wait for every node to confirm the cancellation. Do not use LastUpdated
+	// for this purpose because step transitions change it.
+	// +optional
+	CancelRequestedAt metav1.Time `json:"cancelRequestedAt,omitempty,omitzero"`
+
+	// AnyNodeMutationObserved is set when a reconcile first sees evidence that a node started this
+	// operation's plan. It is never cleared.
+	//
+	// Keep this field sticky. The agent clears plan progress after each completed apply, and informer
+	// lag can hide that change. A cancel-time plan-progress check can therefore return a false negative.
+	// It can incorrectly tell the user that recovery is not required.
+	// +optional
+	AnyNodeMutationObserved bool `json:"anyNodeMutationObserved,omitempty"`
+
+	// TerminationIncomplete is set when any node reports that processes it tried to terminate can still
+	// be running. It is never cleared.
+	//
+	// Rancher has no equivalent signal. The agent's plan-progress checkpoint provides this signal.
+	// +optional
+	TerminationIncomplete bool `json:"terminationIncomplete,omitempty"`
 }

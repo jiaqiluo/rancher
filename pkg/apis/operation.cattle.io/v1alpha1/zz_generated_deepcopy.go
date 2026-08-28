@@ -376,6 +376,7 @@ func (in *OperationStatus) DeepCopyInto(out *OperationStatus) {
 		copy(*out, *in)
 	}
 	in.LastUpdated.DeepCopyInto(&out.LastUpdated)
+	in.CancelRequestedAt.DeepCopyInto(&out.CancelRequestedAt)
 	return
 }
 

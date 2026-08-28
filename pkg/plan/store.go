@@ -58,6 +58,15 @@ type PlanStatus struct {
 
 	// Failed is true if the plan has failed to be applied.
 	Failed bool
+
+	// State is the agent-authored lifecycle state from the plan-state Secret data key.
+	// It is "" when the Secret uses the legacy checksum flow. In that flow, the agent ignores interrupt
+	// annotations.
+	State PlanState
+
+	// Checkpoint is the parsed plan-progress checkpoint. It is nil when the checkpoint is absent, empty,
+	// or uses a different plan checksum. See ParsePlanCheckpoint.
+	Checkpoint *PlanCheckpoint
 }
 
 // Success returns true if the plan has been successfully applied and all probes have passed.
@@ -295,13 +304,15 @@ func (s *Store) AssignPlan(secret *corev1.Secret, plan *Plan, maxFailures, failu
 		secret.Annotations = map[string]string{}
 	}
 
-	result := &PlanStatus{
-		Secret: secret,
-	}
+	planChanged := !bytes.Equal(secret.Data["plan"], data)
 
-	if !bytes.Equal(secret.Data["plan"], data) {
-		result.Pending = true
-		delete(secret.Data, "probe-statuses")
+	if planChanged {
+		// Empty the key instead of deleting it, as required by the needsPending block below. The agent's
+		// conflict-retry merge can restore a deleted key from its in-hand copy. That can resurrect probe
+		// results for the plan that was just replaced.
+		// This is harmless only because the next line empties PlanProbesPassedAnnotation and that annotation
+		// controls the read.
+		secret.Data["probe-statuses"] = []byte{}
 		secret.Annotations[PlanLastUpdatedAnnotation] = time.Now().UTC().Format(time.RFC3339)
 		secret.Annotations[PlanProbesPassedAnnotation] = ""
 
@@ -317,15 +328,100 @@ func (s *Store) AssignPlan(secret *corev1.Secret, plan *Plan, maxFailures, failu
 		} else {
 			delete(secret.Data, "failure-threshold")
 		}
+	}
 
+	// Clear the interrupt annotations unconditionally. Rancher owns every annotation that it sets, and
+	// the agent never changes them.
+	// An operation that reaches AssignPlan is not interrupted by construction. HandleInterrupt returns
+	// before phase dispatch when an interrupt is active.
+	_, wasPaused := secret.Annotations[PlanPausedAnnotation]
+	_, wasCanceled := secret.Annotations[PlanCanceledAnnotation]
+	delete(secret.Annotations, PlanPausedAnnotation)
+	delete(secret.Annotations, PlanCanceledAnnotation)
+
+	// plan-state: pending tells the agent to read and execute new content. Write it for new content and
+	// for byte-identical content assigned to a canceled plan. A recreated operation can produce the same
+	// bytes for the same cluster. Without pending, the agent stays in monitoring-only mode, and
+	// AssignPlan reports InProgress forever.
+	//
+	// Do not write succeeded. It is the normal post-apply polling state. Rewriting it would make the
+	// agent run the plan on every reconcile.
+	// Do not write failed. The controller must observe that state.
+	// Do not write paused. Clearing the annotation above resumes the plan from its checkpoint,
+	// rather than from instruction 0.
+	currentState := PlanState(secret.Data[PlanStateKey])
+	needsPending := planChanged || currentState == PlanStateCanceled
+
+	if needsPending {
+		secret.Data[PlanStateKey] = []byte(PlanStatePending)
+		// Clear this key by writing an empty value. Never delete the key. The agent's conflict-retry merge
+		// carries forward keys from its in-hand copy, so a deleted key can return on retry.
+		// A stale checkpoint can then provide a false completedInstructions value to recovery detection. It
+		// can also provide a false terminationIncomplete value during the next interrupt write.
+		secret.Data[PlanCheckpointKey] = []byte{}
+
+		if !planChanged {
+			// Deliver pending without changing the content only for the delete-and-recreate path: a canceled
+			// operation is replaced by an identical one. Changed content retires the previous run's completion
+			// evidence because appliedPlan and applied-checksum no longer match the plan.
+			//
+			// Identical content does not invalidate those signals. Retire them explicitly here. Otherwise,
+			// completion signals still describe the canceled run, and the recreated operation reports Success()
+			// before the agent executes any instruction.
+			//
+			// Clear both applied keys. Clearing appliedPlan alone does not persist because the plansecret
+			// controller re-mirrors it from a matching applied-checksum. Clearing applied-checksum is safe
+			// because this path requires a plan-state-aware agent. That agent uses plan-state and rewrites the
+			// checksum after the next successful apply.
+			secret.Data["appliedPlan"] = []byte{}
+			secret.Data["applied-checksum"] = []byte{}
+			secret.Data["probe-statuses"] = []byte{}
+			secret.Annotations[PlanProbesPassedAnnotation] = ""
+
+			// Retire the failure evidence for the same reason. The agent has no terminal-state guard for pause
+			// or cancel, so failed -> paused -> canceled is valid. The failed-checksum can therefore still match
+			// the plan.
+			//
+			// If it remains, statusFromSecret reports Failed on the first reconcile of the recreated operation.
+			// With an unbounded failure threshold, it reports Failing instead. Every operation controller checks
+			// planStatus.Failure() immediately after AssignPlan.
+			//
+			// Either key alone is enough to silence statusFromSecret because it reads both keys together. Clear
+			// both keys anyway. This prevents the Secret from retaining part of a record for a run that no
+			// longer exists. The remaining key could otherwise look like evidence for the current plan.
+			secret.Data["failed-checksum"] = []byte{}
+			secret.Data["failure-count"] = []byte{}
+		}
+	}
+
+	if planChanged || needsPending || wasPaused || wasCanceled {
 		secret, err = s.secrets.Update(secret)
 		if err != nil {
 			return nil, err
 		}
-		result.Secret = secret
-	} else {
-		result.Pending = false
-		result.InProgress = true
+	}
+
+	// A Secret with no plan-state here has unchanged content. A content change writes plan-state:
+	// pending above.
+	// statusFromSecret already applies the legacy derivation for this case. AssignPlan does not need
+	// to override it.
+	return statusFromSecret(secret)
+}
+
+// statusFromSecret computes PlanStatus from the Secret only. It performs no writes or API calls.
+// Pass the post-write Secret when the caller just wrote the Secret.
+//
+// When State is non-empty, derive Pending and InProgress from the agent-authored State. Then
+// override them with checksum-derived Applied and Failed. Node checksum evidence takes precedence
+// because State can be stale or an agent can fail to advance it. When State is empty, use the legacy
+// checksum flow. Report InProgress when the plan is neither applied nor failed.
+//
+// Applied, ProbesPassed, Failing, and Failed keep their checksum-derived meaning in both flows.
+func statusFromSecret(secret *corev1.Secret) (*PlanStatus, error) {
+	result := &PlanStatus{
+		Secret:     secret,
+		State:      PlanState(secret.Data[PlanStateKey]),
+		Checkpoint: ParsePlanCheckpoint(secret),
 	}
 
 	probes := secret.Data["probe-statuses"]
@@ -373,9 +469,49 @@ func (s *Store) AssignPlan(secret *corev1.Secret, plan *Plan, maxFailures, failu
 		result.Applied = true
 	}
 
+	switch result.State {
+	case "":
+		// Legacy checksum flow: the plan bytes carry no agent-authored state, so an unfinished plan
+		// is reported as in progress. The Applied and Failed overrides below settle it.
+		result.InProgress = true
+	case PlanStatePending:
+		result.Pending = true
+	case PlanStateInProgress, PlanStatePaused:
+		// A paused plan is still an unfinished one, so it must keep reporting Waiting().
+		result.InProgress = true
+	}
+
 	if result.Applied || result.Failed {
 		result.InProgress = false
 	}
 
+	// A matching applied checksum is first-hand node evidence, so it takes precedence over State. This
+	// prevents a system-agent that predates plan-state from leaving day-2 operations stuck. That agent
+	// reports completion through the applied checksum and does not update plan-state. AssignPlan leaves
+	// Pending in place, and Waiting() exits early on Pending. Without this override, the operation never
+	// completes.
+	//
+	// A plan-state-aware agent cannot produce this state. It commits Pending -> InProgress to the API
+	// server before it applies anything. Therefore, a matching applied checksum means InProgress or a
+	// later state.
+	//
+	// Require both signals. Applied alone is not enough because plansecret controller mirrors appliedPlan
+	// from the agent's applied checksum. A reassigned plan can match previously applied content after
+	// the node moves to another plan. In that case, the new Pending state is authoritative. Requiring
+	// the checksum match preserves Pending for this reassignment case.
+	if result.Applied && string(secret.Data["applied-checksum"]) == PlanHash(planData) {
+		result.Pending = false
+	}
+
 	return result, nil
+}
+
+// Status reports the current plan status for a Secret without writing to it. Use it to poll
+// per-node agent state, such as during cancellation confirmation. Do not use it to enter the
+// write path that AssignPlan owns.
+func (s *Store) Status(secret *corev1.Secret) (*PlanStatus, error) {
+	if secret == nil {
+		return nil, fmt.Errorf("plan: Status called with a nil secret")
+	}
+	return statusFromSecret(secret)
 }

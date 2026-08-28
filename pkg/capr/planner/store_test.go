@@ -7,6 +7,7 @@ import (
 	rkev1 "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1"
 	"github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1/plan"
 	"github.com/rancher/rancher/pkg/capr"
+	planapi "github.com/rancher/rancher/pkg/plan"
 	"github.com/rancher/rancher/pkg/provisioningv2/image"
 	"github.com/rancher/wrangler/v3/pkg/generic"
 	"github.com/stretchr/testify/assert"
@@ -1053,4 +1054,75 @@ func TestSetMachineJoinURL(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestUpdatePlan_ClearsTheDay2InterruptAnnotations pins the CAPR planner's half of the day-2
+// pause/cancel contract.
+//
+// The Operation CRDs (ETCDSnapshotSave, ETCDSnapshotRestore, EncryptionKeyRotation) are reachable
+// against a Provisioning V2 cluster — pkg/operations/imported.go dispatches a v2prov-administrated
+// mgmt Cluster to the CAPR adapter — and pausing one writes plan.cattle.io/paused onto every
+// machine-plan Secret in the cluster, including the ones this planner owns. A leftover paused
+// annotation stops the agent executing anything at all, so provisioning and upgrades stall
+// cluster-wide until it is removed.
+//
+// pkg/plan.Store.AssignPlan clears both annotations on every write for exactly this reason. This
+// is the same guarantee on the planner's own write path: whoever delivers new plan content owns
+// removing the interrupt that would stop it being applied.
+func TestUpdatePlan_ClearsTheDay2InterruptAnnotations(t *testing.T) {
+	t.Parallel()
+
+	const rkeBootstrapName = "bogus-rkebootstrap"
+	mp := newMockPlanner(t, InfoFunctions{})
+
+	secret := &corev1.Secret{
+		Type: capr.SecretTypeMachinePlan,
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      capr.PlanSecretFromBootstrapName(rkeBootstrapName),
+			Namespace: "test",
+			Labels:    map[string]string{capr.WorkerRoleLabel: "true"},
+			Annotations: map[string]string{
+				planapi.PlanPausedAnnotation:   "true",
+				planapi.PlanCanceledAnnotation: "true",
+			},
+		},
+		Data: map[string][]byte{"plan": []byte(`{}`)},
+	}
+
+	entry := &planEntry{
+		Machine: &capi.Machine{
+			ObjectMeta: metav1.ObjectMeta{Name: "test", Namespace: "test"},
+			Spec: capi.MachineSpec{
+				Bootstrap: capi.Bootstrap{
+					ConfigRef: capi.ContractVersionedObjectReference{
+						Kind:     capr.RKEBootstrapKind,
+						Name:     rkeBootstrapName,
+						APIGroup: "rke.cattle.io",
+					},
+				},
+			},
+		},
+		// Metadata mirrors the Secret's own labels and annotations, exactly as PlanStore.Load
+		// builds it — so this also pins that CopyPlanMetadataToSecret cannot put the interrupt
+		// annotations back.
+		Metadata: &plan.Metadata{
+			Labels:      secret.DeepCopy().Labels,
+			Annotations: secret.DeepCopy().Annotations,
+		},
+	}
+
+	mp.secretClient.EXPECT().Get(secret.Namespace, secret.Name, metav1.GetOptions{}).Return(secret, nil)
+	var written *corev1.Secret
+	mp.secretClient.EXPECT().Update(gomock.Any()).DoAndReturn(func(s *corev1.Secret) (*corev1.Secret, error) {
+		written = s
+		return s, nil
+	})
+
+	err := mp.planner.store.UpdatePlan(entry, plan.NodePlan{Files: []plan.File{{Path: "/tmp/x"}}}, "", 1, -1)
+	assert.NoError(t, err)
+
+	assert.NotContains(t, written.Annotations, planapi.PlanPausedAnnotation,
+		"delivering plan content to a node still carrying plan.cattle.io/paused delivers a plan "+
+			"the agent will never apply, and nothing else in the planner ever removes it")
+	assert.NotContains(t, written.Annotations, planapi.PlanCanceledAnnotation)
 }

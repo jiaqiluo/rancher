@@ -401,6 +401,17 @@ func (p *PlanStore) UpdatePlan(entry *planEntry, newNodePlan plan.NodePlan, join
 
 	capr.CopyPlanMetadataToSecret(secret, entry.Metadata)
 
+	// Clear any day-2 interrupt annotations, mirroring pkg/plan.Store.AssignPlan. An Operation CR
+	// (ETCDSnapshotSave, ETCDSnapshotRestore, EncryptionKeyRotation) against a Provisioning V2
+	// cluster reaches the CAPR adapter and writes these onto every machine-plan Secret in the
+	// cluster — including the ones this planner owns — and while plan.cattle.io/paused is set the
+	// agent executes nothing at all. Whoever delivers new plan content owns removing the interrupt
+	// that would stop it from being applied; without this, a stranded annotation halts provisioning
+	// and upgrades on the whole cluster with nothing to clear it. It goes after
+	// CopyPlanMetadataToSecret so a stale copy in entry.Metadata cannot put it back.
+	delete(secret.Annotations, planapi.PlanPausedAnnotation)
+	delete(secret.Annotations, planapi.PlanCanceledAnnotation)
+
 	// If the plan is being updated, then delete the probe-statuses so their healthy status will be reported as healthy only when they pass.
 	delete(secret.Data, "probe-statuses")
 

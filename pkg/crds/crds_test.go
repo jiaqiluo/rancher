@@ -201,6 +201,35 @@ func TestRequiredCRDsIncludesAuthCRDs(t *testing.T) {
 	}
 }
 
+func TestOperationCRDsCarryCancelValidation(t *testing.T) {
+	for _, name := range []string{
+		"etcdsnapshotsaves.operation.cattle.io",
+		"etcdsnapshotrestores.operation.cattle.io",
+		"encryptionkeyrotations.operation.cattle.io",
+	} {
+		t.Run(name, func(t *testing.T) {
+			got, err := getCRDs([]string{name})
+			require.NoError(t, err)
+			require.Len(t, got, 1)
+
+			var cancel *apiextv1.JSONSchemaProps
+			for _, v := range got[0].Spec.Versions {
+				if props, ok := v.Schema.OpenAPIV3Schema.Properties["spec"].Properties["cancel"]; ok {
+					cancel = &props
+				}
+			}
+			require.NotNil(t, cancel, "spec.cancel is missing from the generated schema")
+
+			require.NotNil(t, cancel.Default, "spec.cancel must be defaulted; without it the CEL "+
+				"transition rule is skipped whenever the field is absent and true -> false silently succeeds")
+			require.JSONEq(t, "false", string(cancel.Default.Raw))
+
+			require.Len(t, cancel.XValidations, 1)
+			require.Equal(t, "self || !oldSelf", cancel.XValidations[0].Rule)
+		})
+	}
+}
+
 func setupFakeClient() *FakeClient {
 	fakeClient := &FakeClient{
 		client: fakeclientset.NewSimpleClientset(staticCRD).ApiextensionsV1().(*fake.FakeApiextensionsV1),

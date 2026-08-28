@@ -30,3 +30,16 @@ jobs:
       - name: Run unit tests
         run: go test -cover -tags=test ./pkg/...
 
+      # pkg/apis, pkg/client, and pkg/plan are separate Go modules. The ./pkg/... pattern does not reach
+      # them because the go command excludes nested modules from a parent module's package patterns.
+      # Without these commands, their tests do not run in CI.
+      #
+      # Use plain `go test` without -tags=test. Neither module has test-tagged code. Skip pkg/client because
+      # it contains only generated clients and has no tests.
+      - name: Run unit tests for the nested modules
+        run: |
+          for mod in pkg/apis pkg/plan; do
+            echo "Running unit tests for module $mod"
+            (cd "$mod" && go test -cover ./...)
+          done
+

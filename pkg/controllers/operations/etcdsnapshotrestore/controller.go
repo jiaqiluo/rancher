@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/rancher/lasso/pkg/dynamic"
 	opv1alpha1 "github.com/rancher/rancher/pkg/apis/operation.cattle.io/v1alpha1"
 	"github.com/rancher/rancher/pkg/capr"
 	operationcontrollers "github.com/rancher/rancher/pkg/generated/controllers/operation.cattle.io/v1alpha1"
@@ -29,6 +28,20 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 )
+
+// operationGVK identifies this operation type to the shared pkg/operations helpers: it keys the
+// CancelPolicy registry and is carried on every InterruptScope.
+var operationGVK = opv1alpha1.SchemeGroupVersion.WithKind("ETCDSnapshotRestore")
+
+func init() {
+	// Registered from init(), not from Register(), so the policy is in place before any reconcile
+	// can look it up. RegisterAdapter's own call sites in pkg/operations set the same precedent.
+	ops.RegisterCancelPolicy(operationGVK, ops.CancelPolicy{
+		RequiresRecovery: true,
+		RecoveryMessage: "the restore was interrupted partway and the datastore may be divergent " +
+			"across nodes; run an ETCDSnapshotRestore to recover",
+	})
+}
 
 const (
 	ControllerOwnerKey = "etcd-snapshot-restore"
@@ -150,6 +163,12 @@ rm "$NODENAMESFILE"
 `
 )
 
+// dynamicResolver is the subset of *dynamic.Controller this handler needs.
+type dynamicResolver interface {
+	Get(gvk schema.GroupVersionKind, namespace, name string) (runtime.Object, error)
+	Enqueue(gvk schema.GroupVersionKind, namespace, name string) error
+}
+
 type handler struct {
 	etcdsnapshotrestores operationcontrollers.ETCDSnapshotRestoreController
 
@@ -163,7 +182,7 @@ type handler struct {
 
 	store *plan.Store
 
-	dynamic *dynamic.Controller
+	dynamic dynamicResolver
 
 	clients *wrangler.CAPIContext
 }
@@ -185,6 +204,28 @@ func Register(ctx context.Context, clients *wrangler.CAPIContext) {
 }
 
 func (h *handler) OnChange(op *opv1alpha1.ETCDSnapshotRestore, status opv1alpha1.ETCDSnapshotRestoreStatus) (opv1alpha1.ETCDSnapshotRestoreStatus, error) {
+	if op == nil {
+		return status, nil
+	}
+	if op.DeletionTimestamp != nil {
+		return status, ops.CleanupInterrupts(ops.InterruptCleanupScope[*opv1alpha1.ETCDSnapshotRestore]{
+			LogPrefix:  "etcdsnapshotrestore",
+			Object:     op,
+			ClusterRef: op.Spec.ClusterRef,
+			Dynamic:    h.dynamic,
+			Clients:    h.clients,
+			Secrets:    h.secrets,
+			Controller: h.etcdsnapshotrestores,
+		})
+	}
+
+	// Add the cleanup finalizer before the first annotation. If added after, a delete can occur
+	// after the annotation write but before the finalizer persists. The agent will not get a
+	// chance to clean up and the resource may be stranded.
+	if (op.Spec.Paused || op.Spec.Cancel) && !ops.IsTerminal(status.Phase) && !ops.HasInterruptFinalizer(op) {
+		return status, ops.AddInterruptFinalizerAndUpdate(op.DeepCopy(), h.etcdsnapshotrestores.Update)
+	}
+
 	status, err := h.onChange(op, status)
 	if err != nil {
 		return status, err
@@ -218,11 +259,6 @@ func (h *handler) onChange(op *opv1alpha1.ETCDSnapshotRestore, status opv1alpha1
 	}
 
 	if op.DeletionTimestamp != nil {
-		return status, nil
-	}
-
-	if ops.IsPaused(&op.Spec.OperationSpec) {
-		logrus.Debugf("[etcdsnapshotrestore] %s/%s: skipping paused operation", op.Namespace, op.Name)
 		return status, nil
 	}
 
@@ -287,6 +323,38 @@ func (h *handler) onChange(op *opv1alpha1.ETCDSnapshotRestore, status opv1alpha1
 		return status, nil
 	} else if err != nil {
 		return status, err
+	}
+
+	interrupt := ops.InterruptScope{
+		LogPrefix: "etcdsnapshotrestore",
+		Namespace: op.Namespace,
+		Name:      op.Name,
+		GVK:       operationGVK,
+		Spec:      &op.Spec.OperationSpec,
+		Status:    &status.OperationStatus,
+		SetPhase:  status.SetPhase,
+		Secrets: func() ([]*corev1.Secret, error) {
+			return plan.NewCollector(h.secrets, clusterObj, namespace).
+				WithSorter(plan.DefaultSorter()).
+				WithValidator(plan.AtLeast(1, "")).
+				Collect()
+		},
+		SecretClient: h.secrets,
+		Store:        h.store,
+	}
+
+	handled, err := ops.HandleInterrupt(interrupt)
+	if err != nil {
+		// Deliberately do not propagate this error. The generated status handler restores the pre-reconcile
+		// status when this handler returns an error, and OnChange skips updateStatus in that case. Returning
+		// the error would discard both the sticky mutation evidence from HandleInterrupt and the
+		// CancelRequestedAt timestamp used to measure the failure budget. The agent clears plan progress
+		// after its next apply, so the mutation evidence cannot be recovered.
+		ops.ExpireFailedInterrupt(interrupt, err)
+		return status, nil
+	}
+	if handled {
+		return status, nil
 	}
 
 	s := &scope{
@@ -1647,6 +1715,16 @@ func updateStatus(op *opv1alpha1.ETCDSnapshotRestore, status opv1alpha1.ETCDSnap
 
 	status.ObservedGeneration = op.Generation
 
+	// PausedCondition is deliberately absent from this function. ops.HandleInterrupt owns this
+	// condition. handlePause sets it, handleResume clears it after the interrupt leaves the Secrets,
+	// and handleCancel clears it when cancel replaces pause. Do not derive it from op.Spec.Paused.
+	// That would overwrite all three paths.
+	//
+	// The negative clause is the subtle case and caused a real bug. !op.Spec.Paused marks the resume
+	// case, so clearing the condition here erased handleResume's record of the pause. The next
+	// reconcile then read PausedCondition as False, skipped the resume, and entered phase dispatch.
+	// plan.cattle.io/paused remained on every machine-plan Secret, so the agents stayed halted.
+
 	if status.Phase == opv1alpha1.OperationPhasePending {
 		opv1alpha1.PendingCondition.True(&status)
 	} else if status.Phase == opv1alpha1.OperationPhaseInProgress {
@@ -1673,6 +1751,16 @@ func updateStatus(op *opv1alpha1.ETCDSnapshotRestore, status opv1alpha1.ETCDSnap
 		opv1alpha1.SucceededCondition.False(&status)
 		opv1alpha1.SucceededCondition.Reason(&status, opv1alpha1.NotSuccessfulReason)
 		opv1alpha1.SucceededCondition.Message(&status, "Operation failed")
+	} else if status.Phase == opv1alpha1.OperationPhaseCanceled {
+		opv1alpha1.PendingCondition.False(&status)
+		opv1alpha1.PendingCondition.Reason(&status, opv1alpha1.FinishedReason)
+		opv1alpha1.PendingCondition.Message(&status, "Operation canceled")
+		opv1alpha1.InProgressCondition.False(&status)
+		opv1alpha1.InProgressCondition.Reason(&status, opv1alpha1.FinishedReason)
+		opv1alpha1.InProgressCondition.Message(&status, "Operation canceled")
+		opv1alpha1.SucceededCondition.False(&status)
+		opv1alpha1.SucceededCondition.Reason(&status, opv1alpha1.NotSuccessfulReason)
+		opv1alpha1.SucceededCondition.Message(&status, "Operation canceled")
 	}
 
 	return status

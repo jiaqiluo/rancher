@@ -3,21 +3,31 @@ package encryptionkeyrotation
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	opv1alpha1 "github.com/rancher/rancher/pkg/apis/operation.cattle.io/v1alpha1"
 	rkeplan "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1/plan"
+	"github.com/rancher/rancher/pkg/capr"
 	operationcontrollers "github.com/rancher/rancher/pkg/generated/controllers/operation.cattle.io/v1alpha1"
 	ops "github.com/rancher/rancher/pkg/operations"
 	"github.com/rancher/rancher/pkg/plan"
 	planv1alpha1 "github.com/rancher/rancher/pkg/plan/api/plan.cattle.io/v1alpha1"
 	plancontrollers "github.com/rancher/rancher/pkg/plan/generated/controllers/plan.cattle.io/v1alpha1"
+	"github.com/rancher/wrangler/v3/pkg/generic"
+	ctrlfake "github.com/rancher/wrangler/v3/pkg/generic/fake"
+	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"go.uber.org/mock/gomock"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -133,6 +143,15 @@ func newOp() *opv1alpha1.EncryptionKeyRotation {
 	}
 }
 
+// alreadyInterrupted stamps the cleanup finalizer onto op, simulating the reconcile that persisted
+// it. The first reconcile that observes spec.paused or spec.cancel adds the finalizer and returns
+// without modifying any Secrets, so tests that exercise the interrupt itself must start with the
+// reconcile that follows it.
+func alreadyInterrupted(op *opv1alpha1.EncryptionKeyRotation) *opv1alpha1.EncryptionKeyRotation {
+	op.Finalizers = append(op.Finalizers, ops.InterruptCleanupFinalizer)
+	return op
+}
+
 func newBeacon(owner string, active bool) *planv1alpha1.Beacon {
 	// Beacon ownership lives on Status.Owner; we keep the legacy BeaconOwnerLabel populated so
 	// reclaimStaleBeaconOwnerIfNeeded (which still reads the label) sees a consistent owner.
@@ -177,11 +196,25 @@ func (f *fakeEncryptionKeyRotationController) Get(namespace, name string, opts m
 
 type fakeBeaconClient struct {
 	plancontrollers.BeaconClient
+	getObj          *planv1alpha1.Beacon
+	getErr          error
 	updateCalls     int
 	updates         []*planv1alpha1.Beacon
 	statusUpdates   []*planv1alpha1.Beacon
 	updateErr       error
 	updateStatusErr error
+}
+
+// Get serves the beacon lookup onChange performs after resolving the cluster adapter. An unset
+// getObj/getErr yields NotFound, matching a cluster whose beacon has not been created yet.
+func (f *fakeBeaconClient) Get(_, name string, _ metav1.GetOptions) (*planv1alpha1.Beacon, error) {
+	if f.getErr != nil {
+		return nil, f.getErr
+	}
+	if f.getObj != nil {
+		return f.getObj, nil
+	}
+	return nil, apierrors.NewNotFound(schema.GroupResource{Resource: "beacons"}, name)
 }
 
 func (f *fakeBeaconClient) Update(beacon *planv1alpha1.Beacon) (*planv1alpha1.Beacon, error) {
@@ -229,6 +262,65 @@ func mustGzipJSON(v any) []byte {
 	}
 
 	return buffer.Bytes()
+}
+
+// newImportedPlanSecret builds a machine-plan secret in the namespace ImportedAdapter resolves for
+// newMgmtClusterRef's cluster, carrying the agent-authored plan state the interrupt machinery
+// reads.
+func newImportedPlanSecret(name string, state plan.PlanState) *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   "c-m-test",
+			UID:         types.UID(name + "-uid"),
+			Annotations: map[string]string{},
+			Labels: map[string]string{
+				capr.ClusterNameLabel: "c-m-test",
+			},
+		},
+		Type: plan.SecretTypeMachinePlan,
+		Data: map[string][]byte{
+			"plan":            []byte(`{"instructions":[]}`),
+			plan.PlanStateKey: []byte(state),
+		},
+	}
+}
+
+// newSecretClient mocks the SecretClient the interrupt gate lists and writes through. Update
+// echoes the passed-in secret back and records it so a test can assert on what was written; a
+// non-nil updateErr stands in for a write that fails against the API server, and attempts are
+// recorded whether they succeed or not.
+func newSecretClient(t *testing.T, ctrl *gomock.Controller, updates *[]*corev1.Secret,
+	updateErr error, items ...*corev1.Secret) *ctrlfake.MockClientInterface[*corev1.Secret, *corev1.SecretList] {
+	t.Helper()
+	m := ctrlfake.NewMockClientInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	m.EXPECT().Update(gomock.Any()).DoAndReturn(func(s *corev1.Secret) (*corev1.Secret, error) {
+		if updates != nil {
+			*updates = append(*updates, s.DeepCopy())
+		}
+		if updateErr != nil {
+			return nil, updateErr
+		}
+		return s, nil
+	}).AnyTimes()
+	m.EXPECT().List(gomock.Any(), gomock.Any()).DoAndReturn(func(ns string, opts metav1.ListOptions) (*corev1.SecretList, error) {
+		sel, err := labels.Parse(opts.LabelSelector)
+		if err != nil {
+			return nil, err
+		}
+		var out corev1.SecretList
+		for _, s := range items {
+			if s.Namespace != ns {
+				continue
+			}
+			if !sel.Matches(labels.Set(s.Labels)) {
+				continue
+			}
+			out.Items = append(out.Items, *s)
+		}
+		return &out, nil
+	}).AnyTimes()
+	return m
 }
 
 func TestConvergenceWaitMessage(t *testing.T) {
@@ -437,6 +529,36 @@ func TestStatusFromOutput(t *testing.T) {
 	}
 }
 
+func TestUpdateStatus_CanceledStopsReportingInProgress(t *testing.T) {
+	t.Parallel()
+
+	op := newOp()
+	op.Spec.Cancel = true
+
+	// Exactly what reaches updateStatus after HandleInterrupt finishes a cancellation: the
+	// conditions the InProgress phase left behind, plus the Canceled the gate just wrote.
+	status := opv1alpha1.EncryptionKeyRotationStatus{}
+	opv1alpha1.PendingCondition.False(&status)
+	opv1alpha1.PendingCondition.Reason(&status, opv1alpha1.InProgressReason)
+	opv1alpha1.InProgressCondition.True(&status)
+	status.SetPhase(opv1alpha1.OperationPhaseCanceled)
+	opv1alpha1.CanceledCondition.True(&status)
+	opv1alpha1.CanceledCondition.Reason(&status, opv1alpha1.CanceledReason)
+
+	got := updateStatus(op, status)
+
+	assert.True(t, opv1alpha1.InProgressCondition.IsFalse(&got),
+		"a canceled operation reporting InProgress=True contradicts its own phase")
+	assert.Equal(t, opv1alpha1.FinishedReason, opv1alpha1.PendingCondition.GetReason(&got),
+		"the operation is not waiting to start; it is over")
+	assert.True(t, opv1alpha1.SucceededCondition.IsFalse(&got))
+	assert.Equal(t, opv1alpha1.NotSuccessfulReason, opv1alpha1.SucceededCondition.GetReason(&got))
+
+	assert.True(t, opv1alpha1.CanceledCondition.IsTrue(&got),
+		"CanceledCondition belongs to ops.HandleInterrupt; updateStatus must not re-derive it")
+	assert.Equal(t, opv1alpha1.CanceledReason, opv1alpha1.CanceledCondition.GetReason(&got))
+}
+
 func TestUpdateStatusByPhase(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -516,6 +638,310 @@ func TestUpdateStatusByPhase(t *testing.T) {
 			tt.check(t, status)
 		})
 	}
+}
+
+// newMgmtClusterRef builds a ClusterRef/cluster pair for a plain imported mgmt v3 Cluster. This
+// GVK is the only one ops.NewAdapter can construct without a live wrangler context, allowing
+// onChange to be exercised end-to-end in a unit test.
+func newMgmtClusterRef() (*corev1.ObjectReference, *unstructured.Unstructured) {
+	cluster := &unstructured.Unstructured{}
+	cluster.SetAPIVersion("management.cattle.io/v3")
+	cluster.SetKind("Cluster")
+	cluster.SetName("c-m-test")
+
+	return &corev1.ObjectReference{
+		APIVersion: "management.cattle.io/v3",
+		Kind:       "Cluster",
+		Name:       "c-m-test",
+	}, cluster
+}
+
+func TestCancelPolicyRegistered(t *testing.T) {
+	t.Parallel()
+
+	policy := ops.CancelPolicyFor(operationGVK)
+	assert.True(t, policy.RequiresRecovery,
+		"a rotation stopped partway can leave the cluster in a mixed key state")
+	assert.NotEmpty(t, policy.RecoveryMessage)
+}
+
+func TestOnChange_PausedStillReportsPausedCondition(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	op := newOp()
+	op.Spec.Paused = true
+
+	clusterRef, cluster := newMgmtClusterRef()
+	op.Spec.ClusterRef = clusterRef
+
+	var updates []*corev1.Secret
+	secrets := newSecretClient(t, ctrl, &updates, nil, newImportedPlanSecret("plan-a", plan.PlanStateInProgress))
+
+	beacons := &fakeBeaconClient{getObj: newBeacon("", false)}
+	h := &handler{
+		beacons: beacons,
+		secrets: secrets,
+		store:   plan.NewStore(secrets),
+		dynamic: &fakeDynamic{getObj: cluster},
+	}
+
+	status, err := h.onChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
+	assert.NoError(t, err)
+	status = updateStatus(op, status)
+
+	assert.True(t, opv1alpha1.PausedCondition.IsTrue(&status),
+		"a paused operation must still report PausedCondition so the user can see the pause took effect")
+	assert.Equal(t, opv1alpha1.PauseRequestedReason, opv1alpha1.PausedCondition.GetReason(&status),
+		"the node has not reported a paused plan state yet, so the pause is requested, not in effect")
+	assert.Equal(t, opv1alpha1.OperationPhasePending, status.Phase,
+		"the interrupt handling must run after the empty-phase defaulting, not before it")
+	assert.Empty(t, beacons.statusUpdates,
+		"the interrupt handling must run before the phase dispatch, so no phase handler may touch the beacon")
+	if assert.Len(t, updates, 1, "the pause must be propagated to the machine-plan secret") {
+		assert.Equal(t, "true", updates[0].Annotations[plan.PlanPausedAnnotation])
+	}
+}
+
+// newPlanlessImportedSecret builds a machine-plan Secret that has never been assigned a plan,
+// matching how pkg/controllers/capr/unmanaged creates one: with no Data at all. Any cluster with a
+// node that the operation's steps do not target can have one, such as a worker under a control-plane-
+// scoped step or a node that registered mid-flight.
+func newPlanlessImportedSecret(name string) *corev1.Secret {
+	secret := newImportedPlanSecret(name, "")
+	secret.Data = nil
+	return secret
+}
+
+// TestOnChange_CancelIsNotHeldUpByASecretThatNeverGotAPlan pins the read-side behavior of the
+// unfiltered Secrets contract. The write side remains intentionally cluster-wide: different steps
+// target different subsets of nodes, so an interrupt must reach every Secret. But a node that the
+// operation never assigned a plan has no plan-state and never will.
+//
+// Under this operation type's cancel policy, counting that node on the read side has two costs: it
+// makes cancellation wait the full CancelConfirmationTimeout while holding the beacon, then
+// reports RecoveryRequired even though no key was ever rotated on that node.
+func TestOnChange_CancelIsNotHeldUpByASecretThatNeverGotAPlan(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	op := alreadyInterrupted(newOp())
+	op.Spec.Cancel = true
+	clusterRef, cluster := newMgmtClusterRef()
+	op.Spec.ClusterRef = clusterRef
+
+	confirmed := newImportedPlanSecret("cp-a", plan.PlanStateCanceled)
+	planless := newPlanlessImportedSecret("worker-b")
+
+	var updates []*corev1.Secret
+	secrets := newSecretClient(t, ctrl, &updates, nil, confirmed, planless)
+
+	beacons := &fakeBeaconClient{getObj: newBeacon(beaconOwnerKey(op), true)}
+	h := &handler{
+		beacons: beacons,
+		secrets: secrets,
+		store:   plan.NewStore(secrets),
+		dynamic: &fakeDynamic{getObj: cluster},
+	}
+
+	status := opv1alpha1.EncryptionKeyRotationStatus{}
+	status.SetPhase(opv1alpha1.OperationPhaseInProgress)
+
+	got, err := h.onChange(op, status)
+	assert.NoError(t, err)
+
+	assert.Equal(t, opv1alpha1.OperationPhaseCanceled, got.Phase,
+		"a Secret with no plan has nothing to stop; waiting for it to confirm holds the beacon "+
+			"for the full CancelConfirmationTimeout on every cluster with a worker node")
+	assert.Equal(t, opv1alpha1.CanceledReason, opv1alpha1.CanceledCondition.GetReason(&got),
+		"no plan was ever assigned here, which is not the legacy checksum flow and not a slow agent")
+
+	assert.False(t, got.AnyNodeMutationObserved,
+		"nothing executed: one node confirmed the cancellation and the other never had a plan")
+	assert.True(t, opv1alpha1.RecoveryRequiredCondition.IsFalse(&got),
+		"a worker node with no plan is not evidence that a key rotation ran halfway")
+
+	assert.Len(t, updates, 2,
+		"the write side stays unfiltered: every machine-plan Secret is annotated, including the "+
+			"plan-less one, because a later step may yet target it")
+}
+
+func TestUpdateStatus_DoesNotClobberTheInterruptPausedReason(t *testing.T) {
+	t.Parallel()
+
+	op := newOp()
+	op.Spec.Paused = true
+
+	status := opv1alpha1.EncryptionKeyRotationStatus{}
+	// Stand in for what HandleInterrupt wrote earlier in the same reconcile.
+	opv1alpha1.PausedCondition.True(&status)
+	opv1alpha1.PausedCondition.Reason(&status, opv1alpha1.PauseRequestedReason)
+
+	got := updateStatus(op, status)
+	assert.Equal(t, opv1alpha1.PauseRequestedReason, opv1alpha1.PausedCondition.GetReason(&got),
+		"updateStatus must not re-derive PausedCondition from the spec alone; that loses the "+
+			"requested-vs-in-effect distinction HandleInterrupt computes from the agent")
+}
+
+func TestUpdateStatus_DoesNotClobberACanceledOperationsClearedPause(t *testing.T) {
+	t.Parallel()
+
+	op := newOp()
+	op.Spec.Paused = true
+	op.Spec.Cancel = true
+
+	status := opv1alpha1.EncryptionKeyRotationStatus{}
+	// HandleInterrupt clears the pause when a cancel lands, because cancel beats pause on the
+	// machine-plan Secrets too. Re-deriving from the spec would put it straight back.
+	opv1alpha1.PausedCondition.False(&status)
+	opv1alpha1.PausedCondition.Reason(&status, opv1alpha1.NotPausedReason)
+
+	got := updateStatus(op, status)
+	assert.True(t, opv1alpha1.PausedCondition.IsFalse(&got),
+		"a canceled operation must not report Paused alongside Canceled")
+}
+
+func TestUpdateStatus_NeverTouchesThePausedCondition(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		paused bool
+		seed   func(*opv1alpha1.EncryptionKeyRotationStatus)
+		want   string
+	}{
+		{
+			name: "unset stays unset",
+			want: "",
+		},
+		{
+			// The case that mattered: !op.Spec.Paused is the resume case, and clearing here erased
+			// handleResume's record that there is still an interrupt to lift off the Secrets.
+			name: "a failing resume's record survives",
+			seed: func(s *opv1alpha1.EncryptionKeyRotationStatus) {
+				opv1alpha1.PausedCondition.True(s)
+				opv1alpha1.PausedCondition.Reason(s, opv1alpha1.ResumeFailedReason)
+			},
+			want: opv1alpha1.ResumeFailedReason,
+		},
+		{
+			name:   "a pause in effect survives",
+			paused: true,
+			seed: func(s *opv1alpha1.EncryptionKeyRotationStatus) {
+				opv1alpha1.PausedCondition.True(s)
+				opv1alpha1.PausedCondition.Reason(s, opv1alpha1.PausedReason)
+			},
+			want: opv1alpha1.PausedReason,
+		},
+		{
+			name: "a completed resume's clear survives",
+			seed: func(s *opv1alpha1.EncryptionKeyRotationStatus) {
+				opv1alpha1.PausedCondition.False(s)
+				opv1alpha1.PausedCondition.Reason(s, opv1alpha1.NotPausedReason)
+			},
+			want: opv1alpha1.NotPausedReason,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			op := newOp()
+			op.Spec.Paused = tc.paused
+
+			status := opv1alpha1.EncryptionKeyRotationStatus{}
+			if tc.seed != nil {
+				tc.seed(&status)
+			}
+			before := status.DeepCopy()
+
+			got := updateStatus(op, status)
+
+			assert.Equal(t, tc.want, opv1alpha1.PausedCondition.GetReason(&got),
+				"ops.HandleInterrupt owns PausedCondition outright; updateStatus deriving it from "+
+					"the spec in either direction clobbers handlePause, handleResume and handleCancel")
+			assert.Equal(t, opv1alpha1.PausedCondition.GetStatus(before),
+				opv1alpha1.PausedCondition.GetStatus(&got))
+		})
+	}
+}
+
+// runStatusHandler sends op through the generated status handler. This is the same path that the
+// wrangler-registered controller uses in production.
+//
+// The helper returns the status that the handler persists. It returns nil when the handler writes
+// no status.
+//
+// See the equivalent helper in etcdsnapshotsave tests. A handwritten stand-in does not test the
+// same code path.
+func runStatusHandler(t *testing.T, ctrl *gomock.Controller, h *handler, op *opv1alpha1.EncryptionKeyRotation) *opv1alpha1.EncryptionKeyRotationStatus {
+	t.Helper()
+
+	var sync generic.Handler
+	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
+	rotations.EXPECT().AddGenericHandler(gomock.Any(), gomock.Any(), gomock.Any()).
+		Do(func(_ context.Context, _ string, handler generic.Handler) { sync = handler })
+	rotations.EXPECT().EnqueueAfter(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	var persisted *opv1alpha1.EncryptionKeyRotationStatus
+	rotations.EXPECT().UpdateStatus(gomock.Any()).DoAndReturn(func(o *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) {
+		persisted = o.Status.DeepCopy()
+		return o, nil
+	}).AnyTimes()
+
+	h.encryptionkeyrotations = rotations
+	operationcontrollers.RegisterEncryptionKeyRotationStatusHandler(context.Background(), rotations, "", "test", h.OnChange)
+	require.NotNil(t, sync, "RegisterEncryptionKeyRotationStatusHandler must have installed a handler")
+
+	_, err := sync(op.Namespace+"/"+op.Name, op)
+	assert.NoError(t, err, "the interrupt gate must not propagate its error; the framework would revert the status")
+
+	return persisted
+}
+
+func TestOnChange_ResumeFailurePersistsThePausedConditionSoTheNextReconcileRetries(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	// Neither paused nor cancelled in the spec, but recorded as paused on the status: the user has
+	// withdrawn a pause and Rancher has not managed to lift it from the Secrets yet.
+	op := newOp()
+	clusterRef, cluster := newMgmtClusterRef()
+	op.Spec.ClusterRef = clusterRef
+	op.Status.SetPhase(opv1alpha1.OperationPhaseInProgress)
+	opv1alpha1.PausedCondition.True(&op.Status)
+	opv1alpha1.PausedCondition.Reason(&op.Status, opv1alpha1.PausedReason)
+
+	secret := newImportedPlanSecret("a", plan.PlanStateInProgress)
+	secret.Annotations[plan.PlanPausedAnnotation] = "true"
+
+	var updates []*corev1.Secret
+	secrets := newSecretClient(t, ctrl, &updates, errors.New("etcdserver: request timed out"), secret)
+	beacons := &fakeBeaconClient{getObj: newBeacon(beaconOwnerKey(op), true)}
+	h := &handler{
+		beacons: beacons,
+		secrets: secrets,
+		store:   plan.NewStore(secrets),
+		dynamic: &fakeDynamic{getObj: cluster},
+	}
+
+	persisted := runStatusHandler(t, ctrl, h, op)
+
+	require.NotNil(t, persisted, "the failed resume must write a status")
+	assert.True(t, opv1alpha1.PausedCondition.IsTrue(persisted),
+		"PausedCondition is the only user-visible evidence that the resume was dropped, and it is "+
+			"also handleResume's record that there is still an interrupt to lift; updateStatus "+
+			"must not erase it out from under HandleInterrupt")
+	assert.Equal(t, opv1alpha1.ResumeFailedReason, opv1alpha1.PausedCondition.GetReason(persisted))
+	assert.Equal(t, "true", secret.Annotations[plan.PlanPausedAnnotation],
+		"the agents really are still halted, which is what the condition has to keep saying")
+	assert.Len(t, updates, 1, "the resume attempted exactly one write, and it failed")
+
+	next := op.DeepCopy()
+	next.Status = *persisted
+
+	assert.Nil(t, runStatusHandler(t, ctrl, h, next),
+		"a retry that reports the same thing must leave the status byte-identical")
+	assert.Len(t, updates, 2,
+		"handleResume must have run again; one attempt total would mean its PausedCondition gate "+
+			"read False and the operation fell through to the phase dispatch")
+	assert.Empty(t, beacons.statusUpdates, "no phase handler may touch the beacon")
 }
 
 func TestHandleFailed_HoldingBeaconReleasesAndUnpauses(t *testing.T) {
@@ -896,4 +1322,232 @@ func TestReclaimStaleBeaconOwnerIfNeeded(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- interrupt-cleanup finalizer -------------------------------------------------------------
+
+func TestOnChange_DeletionRunsCleanupAndDropsTheFinalizer(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	// Both annotations, not just paused. A cancellation that ran to completion leaves the canceled
+	// annotation behind too, and cleanup must not gate on PausedCondition — which handleCancel
+	// deliberately clears — to decide whether there is anything to clear.
+	secret := newImportedPlanSecret("plan-a", plan.PlanStatePaused)
+	secret.Annotations[plan.PlanPausedAnnotation] = "true"
+	secret.Annotations[plan.PlanCanceledAnnotation] = "true"
+
+	clusterRef, cluster := newMgmtClusterRef()
+	ts := metav1.NewTime(time.Now())
+	op := alreadyInterrupted(newOp())
+	op.DeletionTimestamp = &ts
+	op.Spec.ClusterRef = clusterRef
+
+	var updates []*corev1.Secret
+	secrets := newSecretClient(t, ctrl, &updates, nil, secret)
+
+	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
+	var finalFinalizers []string
+	rotations.EXPECT().Update(gomock.Any()).DoAndReturn(
+		func(o *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) {
+			finalFinalizers = o.Finalizers
+			return o, nil
+		}).Times(1)
+
+	h := &handler{
+		encryptionkeyrotations: rotations,
+		beacons:                &fakeBeaconClient{},
+		secrets:                secrets,
+		store:                  plan.NewStore(secrets),
+		dynamic:                &fakeDynamic{getObj: cluster},
+	}
+
+	_, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
+	assert.NoError(t, err)
+	assert.Empty(t, finalFinalizers, "cleanup succeeded, so the finalizer must be dropped")
+
+	if assert.Len(t, updates, 1, "the leftover annotations must be cleared from the machine-plan secret") {
+		assert.NotContains(t, updates[0].Annotations, plan.PlanPausedAnnotation,
+			"a stranded paused annotation halts every plan on the node with no CR left to explain why")
+		assert.NotContains(t, updates[0].Annotations, plan.PlanCanceledAnnotation)
+	}
+}
+
+func TestOnChange_DeletionForceRemovesTheFinalizerOnceTheBudgetIsSpent(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	clusterRef, _ := newMgmtClusterRef()
+	ts := metav1.NewTime(time.Now().Add(-2 * ops.InterruptCleanupBudget))
+	op := alreadyInterrupted(newOp())
+	op.DeletionTimestamp = &ts
+	op.Spec.ClusterRef = clusterRef
+
+	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
+	var finalFinalizers []string
+	rotations.EXPECT().Update(gomock.Any()).DoAndReturn(
+		func(o *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) {
+			finalFinalizers = o.Finalizers
+			return o, nil
+		}).Times(1)
+
+	secrets := newSecretClient(t, ctrl, nil, nil)
+	h := &handler{
+		encryptionkeyrotations: rotations,
+		beacons:                &fakeBeaconClient{},
+		secrets:                secrets,
+		store:                  plan.NewStore(secrets),
+		// getErr is a permanent, non-NotFound failure: the clusterRef GVK no longer resolves.
+		dynamic: &fakeDynamic{getErr: errors.New("no matches for kind")},
+	}
+
+	logs := captureLogs(t)
+
+	status, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
+	assert.NoError(t, err,
+		"an undeletable CR blocks namespace teardown and cluster deprovisioning; a stranded "+
+			"annotation is recoverable with one kubectl command. Force-remove is the lesser failure.")
+	assert.Empty(t, finalFinalizers)
+
+	assert.Equal(t, opv1alpha1.EncryptionKeyRotationStatus{}, status,
+		"a condition written here can never be read: the Update that drops the finalizer makes the "+
+			"framework's UpdateStatus 409, and the next reconcile finds no finalizer and never "+
+			"retries. The log is the only honest channel, so nothing may be written to the status")
+
+	assert.Contains(t, logs.String(), opv1alpha1.InterruptCleanupIncompleteReason,
+		"the log line needs a stable token for alerting to key on")
+	assert.Contains(t, logs.String(),
+		"kubectl get secret -A --field-selector type=rke.cattle.io/machine-plan",
+		"the cluster never resolved, so the operator gets a discovery command rather than a guessed namespace")
+}
+
+func TestOnChange_DeletionWithNoFinalizerIsANoOp(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	ts := metav1.NewTime(time.Now())
+	op := newOp()
+	op.DeletionTimestamp = &ts
+
+	secrets := newSecretClient(t, ctrl, nil, nil)
+	h := &handler{secrets: secrets, store: plan.NewStore(secrets)}
+
+	_, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
+	assert.NoError(t, err, "an operation that never wrote an annotation must never be delayed")
+}
+
+// captureLogs redirects logrus for the duration of the test and returns the buffer it writes to.
+// See the identical helper in etcdsnapshotsave's tests for why the process-global redirect is safe
+// here.
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	previous := logrus.StandardLogger().Out
+	logrus.SetOutput(&buf)
+	t.Cleanup(func() { logrus.SetOutput(previous) })
+	return &buf
+}
+
+func TestOnChange_DeletionForceRemovalNamesTheSecretsNamespaceNotTheOperations(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	clusterRef, cluster := newMgmtClusterRef()
+	ts := metav1.NewTime(time.Now().Add(-2 * ops.InterruptCleanupBudget))
+	op := alreadyInterrupted(newOp())
+	op.DeletionTimestamp = &ts
+	op.Spec.ClusterRef = clusterRef
+	require.Equal(t, "fleet-default", op.Namespace)
+	require.Empty(t, clusterRef.Namespace, "the mgmt v3 Cluster is cluster-scoped")
+
+	// The cluster resolves, so the scope is known; the Secret List is what fails.
+	secrets := ctrlfake.NewMockClientInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secrets.EXPECT().List(gomock.Any(), gomock.Any()).
+		Return(nil, errors.New("etcdserver: request timed out")).AnyTimes()
+
+	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
+	rotations.EXPECT().Update(gomock.Any()).DoAndReturn(
+		func(o *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) { return o, nil }).Times(1)
+
+	h := &handler{
+		encryptionkeyrotations: rotations,
+		beacons:                &fakeBeaconClient{},
+		secrets:                secrets,
+		store:                  plan.NewStore(secrets),
+		dynamic:                &fakeDynamic{getObj: cluster},
+	}
+
+	logs := captureLogs(t)
+	_, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
+	assert.NoError(t, err)
+
+	assert.Contains(t, logs.String(),
+		"kubectl annotate secret -n c-m-test -l rke.cattle.io/cluster-name=c-m-test "+
+			"plan.cattle.io/canceled- plan.cattle.io/paused-",
+		"the command must select exactly the Secrets the cleanup collector reads")
+	assert.NotContains(t, logs.String(), "-n fleet-default",
+		"the operation's own namespace holds no machine-plan Secrets")
+}
+
+func TestOnChange_TheFirstInterruptPersistsTheFinalizerBeforeAnnotatingAnything(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	op := newOp()
+	op.Spec.Paused = true
+	clusterRef, cluster := newMgmtClusterRef()
+	op.Spec.ClusterRef = clusterRef
+
+	var updates []*corev1.Secret
+	secrets := newSecretClient(t, ctrl, &updates, nil, newImportedPlanSecret("plan-a", plan.PlanStateInProgress))
+
+	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
+	var written []string
+	rotations.EXPECT().Update(gomock.Any()).DoAndReturn(
+		func(o *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) {
+			written = o.Finalizers
+			return o, nil
+		}).Times(1)
+
+	h := &handler{
+		encryptionkeyrotations: rotations,
+		beacons:                &fakeBeaconClient{getObj: newBeacon("", false)},
+		secrets:                secrets,
+		store:                  plan.NewStore(secrets),
+		dynamic:                &fakeDynamic{getObj: cluster},
+	}
+
+	_, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
+	assert.NoError(t, err)
+	assert.Equal(t, []string{ops.InterruptCleanupFinalizer}, written,
+		"the finalizer has to be persisted before the first annotation, never after")
+	assert.Empty(t, updates,
+		"no machine-plan secret may be annotated on the reconcile that writes the finalizer")
+}
+
+func TestOnChange_TerminalOperationNeverAcquiresTheFinalizer(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	// HandleInterrupt returns early for a terminal operation, so pausing one writes no annotation
+	// anywhere. A finalizer here would guard nothing.
+	op := newOp()
+	op.Spec.Paused = true
+	clusterRef, cluster := newMgmtClusterRef()
+	op.Spec.ClusterRef = clusterRef
+
+	status := opv1alpha1.EncryptionKeyRotationStatus{}
+	status.SetPhase(opv1alpha1.OperationPhaseSucceeded)
+	op.Status = status
+
+	secrets := newSecretClient(t, ctrl, nil, nil, newImportedPlanSecret("plan-a", plan.PlanStateSucceeded))
+	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
+	rotations.EXPECT().Update(gomock.Any()).Times(0)
+	rotations.EXPECT().EnqueueAfter(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+	rotations.EXPECT().Delete(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+
+	h := &handler{
+		encryptionkeyrotations: rotations,
+		beacons:                &fakeBeaconClient{getObj: newBeacon("", false)},
+		secrets:                secrets,
+		store:                  plan.NewStore(secrets),
+		dynamic:                &fakeDynamic{getObj: cluster},
+	}
+
+	_, err := h.OnChange(op, status)
+	assert.NoError(t, err)
 }

@@ -68,6 +68,15 @@ spec:
                     description: Name specifies the name of the ETCD snapshot file.
                     type: string
                 type: object
+              cancel:
+                default: false
+                description: |-
+                  Cancel requests the operation stop permanently. Unlike Paused, it is terminal and cannot be unset.
+                  Recover by deleting and recreating the operation. If both Paused and Cancel are true, Cancel wins.
+                type: boolean
+                x-kubernetes-validations:
+                - message: cancel cannot be unset once true
+                  rule: self || !oldSelf
               clusterRef:
                 description: ClusterRef is a reference to the Cluster this operation
                   is associated with.
@@ -132,6 +141,24 @@ spec:
           status:
             description: Status is the observed state of the ETCDSnapshotSave.
             properties:
+              anyNodeMutationObserved:
+                description: |-
+                  AnyNodeMutationObserved is set when a reconcile first sees evidence that a node started this
+                  operation's plan. It is never cleared.
+
+                  Keep this field sticky. The agent clears plan progress after each completed apply, and informer
+                  lag can hide that change. A cancel-time plan-progress check can therefore return a false negative.
+                  It can incorrectly tell the user that recovery is not required.
+                type: boolean
+              cancelRequestedAt:
+                description: |-
+                  CancelRequestedAt is set once when the first reconcile observes Spec.Cancel while the operation
+                  is InProgress. It is never rewritten.
+
+                  It anchors the bounded wait for every node to confirm the cancellation. Do not use LastUpdated
+                  for this purpose because step transitions change it.
+                format: date-time
+                type: string
               conditions:
                 description: |-
                   Conditions represent the latest available observations of an operation's current state.
@@ -205,6 +232,13 @@ spec:
                 - Save
                 - Restart
                 type: string
+              terminationIncomplete:
+                description: |-
+                  TerminationIncomplete is set when any node reports that processes it tried to terminate can still
+                  be running. It is never cleared.
+
+                  Rancher has no equivalent signal. The agent's plan-progress checkpoint provides this signal.
+                type: boolean
             type: object
         required:
         - spec

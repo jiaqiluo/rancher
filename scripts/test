@@ -25,6 +25,17 @@ cd $(dirname $0)/..
 echo Running unit tests
 CGO_ENABLED=0 go test -cover -tags=test ./pkg/...
 
+# pkg/apis, pkg/client and pkg/plan are separate Go modules, and the ./pkg/... pattern above does
+# not reach them: the go command excludes nested modules from a parent module's package patterns.
+# Without this loop their tests never run at all.
+#
+# Plain go test, no -tags=test: neither module has any test-tagged code. pkg/client is omitted
+# because it has no tests of its own -- it is generated clients only.
+for mod in pkg/apis pkg/plan; do
+    echo "Running unit tests for module $mod"
+    (cd "$mod" && CGO_ENABLED=0 go test -cover ./...)
+done
+
 if [ ${ARCH} == arm64 ] || [ ${ARCH} == s390x ]; then
     export ETCD_UNSUPPORTED_ARCH=${ARCH}
 fi
