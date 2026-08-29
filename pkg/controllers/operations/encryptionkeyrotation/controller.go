@@ -34,6 +34,12 @@ import (
 const ControllerOwnerKey = "encryption-key-rotation"
 const beaconOwnerRefAnnotation = "rke.cattle.io/operation-owner-ref"
 
+// cleanupHandlerName names the OnRemove handler that undoes this operation's cluster-side effects.
+// It is persisted data: wrangler derives the finalizer "wrangler.cattle.io/<name>" from it and
+// writes that onto every operation. Renaming it orphans finalizers on live objects, which then
+// cannot be deleted.
+const cleanupHandlerName = "encryption-key-rotation-cleanup"
+
 // operationGVK identifies this operation type to the shared pkg/operations helpers: it keys the
 // CancelPolicy registry and is carried on every InterruptScope.
 var operationGVK = opv1alpha1.SchemeGroupVersion.WithKind("EncryptionKeyRotation")
@@ -109,29 +115,72 @@ func Register(ctx context.Context, clients *wrangler.CAPIContext) {
 	}
 
 	operationcontrollers.RegisterEncryptionKeyRotationStatusHandler(ctx, clients.Operation.EncryptionKeyRotation(), "", "encryption-key-rotation-handler", h.OnChange)
+
+	// OnRemove owns deletion cleanup. wrangler adds its own finalizer on the first reconcile of
+	// every operation, which is the only way the handler is guaranteed to observe the deletion at
+	// all: an operation with no finalizer is removed by the API server in one transaction, so no
+	// terminating state is ever written and no reconcile can see it.
+	clients.Operation.EncryptionKeyRotation().OnRemove(ctx, cleanupHandlerName, h.OnRemove)
+}
+
+// OnRemove undoes this operation's cluster-side effects: interrupt annotations on machine-plan
+// Secrets, then its hold on the cluster beacon.
+//
+// The beacon half matters because the terminal-phase handlers are the only other release path. An
+// operation deleted while still running owns the beacon with nothing to reclaim it, which wedges
+// every later day-2 operation on that cluster. reclaimStaleBeaconOwnerIfNeeded still covers what
+// this cannot — a UID that no longer matches, or an owner that reached a terminal phase without
+// releasing — so both remain.
+//
+// The operation is returned unmodified. wrangler removes its finalizer from whatever this returns,
+// so handing back a stale copy of an object we had updated would conflict — this handler writes
+// only Secrets and the Beacon, never the operation.
+func (h *handler) OnRemove(_ string, op *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) {
+	if op == nil {
+		return op, nil
+	}
+
+	return op, ops.CleanupOperation(ops.CleanupScope{
+		LogPrefix:  "encryptionkeyrotation",
+		Object:     op,
+		ClusterRef: op.Spec.ClusterRef,
+		Dynamic:    h.dynamic,
+		Clients:    h.clients,
+		Secrets:    h.secrets,
+		Beacons:    h.beacons,
+		OwnerKey:   beaconOwnerKey(op),
+		AfterRelease: func(beacon *planv1alpha1.Beacon) error {
+			return h.clearBeaconOwnerRef(op, beacon)
+		},
+	})
+}
+
+// clearBeaconOwnerRef removes this operation's owner-ref annotation from the cluster beacon.
+// Unlike the other operation types, this one records its owner here as well as in Status.Owner,
+// and a leftover annotation points at an operation that no longer exists.
+//
+// An annotation naming a different operation belongs to that operation and is left alone:
+// reclaimStaleBeaconOwnerIfNeeded reads it to decide whether that owner is still alive.
+func (h *handler) clearBeaconOwnerRef(op *opv1alpha1.EncryptionKeyRotation, beacon *planv1alpha1.Beacon) error {
+	want := fmt.Sprintf("%s/%s/%s", op.Namespace, op.Name, op.UID)
+	if beacon.Annotations == nil || beacon.Annotations[beaconOwnerRefAnnotation] != want {
+		return nil
+	}
+
+	updated := beacon.DeepCopy()
+	delete(updated.Annotations, beaconOwnerRefAnnotation)
+	_, err := h.beacons.Update(updated)
+	return err
 }
 
 func (h *handler) OnChange(op *opv1alpha1.EncryptionKeyRotation, status opv1alpha1.EncryptionKeyRotationStatus) (opv1alpha1.EncryptionKeyRotationStatus, error) {
 	if op == nil {
 		return status, nil
 	}
+	// A terminating operation has no status left to drive. Cleanup belongs to OnRemove, which runs
+	// under wrangler's finalizer and is the only handler that must not be skipped here.
 	if op.DeletionTimestamp != nil {
-		return status, ops.CleanupInterrupts(ops.InterruptCleanupScope[*opv1alpha1.EncryptionKeyRotation]{
-			LogPrefix:  "encryptionkeyrotation",
-			Object:     op,
-			ClusterRef: op.Spec.ClusterRef,
-			Dynamic:    h.dynamic,
-			Clients:    h.clients,
-			Secrets:    h.secrets,
-			Controller: h.encryptionkeyrotations,
-		})
-	}
-
-	// Add the cleanup finalizer before the first annotation. If added after, a delete can occur
-	// after the annotation write but before the finalizer persists. The agent will not get a
-	// chance to clean up and the resource may be stranded.
-	if (op.Spec.Paused || op.Spec.Cancel) && !ops.IsTerminal(status.Phase) && !ops.HasInterruptFinalizer(op) {
-		return status, ops.AddInterruptFinalizerAndUpdate(op.DeepCopy(), h.encryptionkeyrotations.Update)
+		return status, nil
 	}
 
 	status, err := h.onChange(op, status)

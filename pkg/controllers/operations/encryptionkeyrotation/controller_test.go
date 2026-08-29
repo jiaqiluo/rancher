@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -141,15 +142,6 @@ func newOp() *opv1alpha1.EncryptionKeyRotation {
 			UID:       types.UID("ekr-uid"),
 		},
 	}
-}
-
-// alreadyInterrupted stamps the cleanup finalizer onto op, simulating the reconcile that persisted
-// it. The first reconcile that observes spec.paused or spec.cancel adds the finalizer and returns
-// without modifying any Secrets, so tests that exercise the interrupt itself must start with the
-// reconcile that follows it.
-func alreadyInterrupted(op *opv1alpha1.EncryptionKeyRotation) *opv1alpha1.EncryptionKeyRotation {
-	op.Finalizers = append(op.Finalizers, ops.InterruptCleanupFinalizer)
-	return op
 }
 
 func newBeacon(owner string, active bool) *planv1alpha1.Beacon {
@@ -723,7 +715,7 @@ func newPlanlessImportedSecret(name string) *corev1.Secret {
 func TestOnChange_CancelIsNotHeldUpByASecretThatNeverGotAPlan(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	op := alreadyInterrupted(newOp())
+	op := newOp()
 	op.Spec.Cancel = true
 	clusterRef, cluster := newMgmtClusterRef()
 	op.Spec.ClusterRef = clusterRef
@@ -1324,9 +1316,27 @@ func TestReclaimStaleBeaconOwnerIfNeeded(t *testing.T) {
 	}
 }
 
-// --- interrupt-cleanup finalizer -------------------------------------------------------------
+// --- deletion cleanup (OnRemove) ---------------------------------------------------------------
 
-func TestOnChange_DeletionRunsCleanupAndDropsTheFinalizer(t *testing.T) {
+// newDeletingOp returns the operation as a user has just deleted it: terminating, pointing at the
+// imported mgmt v3 cluster. No finalizer is set — wrangler stamps
+// wrangler.cattle.io/encryption-key-rotation-cleanup onto every operation and calls OnRemove under
+// it, so the handler under test never sees or touches a finalizer.
+func newDeletingOp(deletedAt time.Time) *opv1alpha1.EncryptionKeyRotation {
+	op := newOp()
+	ts := metav1.NewTime(deletedAt)
+	op.DeletionTimestamp = &ts
+	clusterRef, _ := newMgmtClusterRef()
+	op.Spec.ClusterRef = clusterRef
+	return op
+}
+
+// ownerRefFor mirrors the owner-ref string handlePending writes onto the beacon.
+func ownerRefFor(op *opv1alpha1.EncryptionKeyRotation) string {
+	return fmt.Sprintf("%s/%s/%s", op.Namespace, op.Name, op.UID)
+}
+
+func TestOnRemove_ClearsAnnotationsAndReleasesTheBeacon(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	// Both annotations, not just paused. A cancellation that ran to completion leaves the canceled
@@ -1336,101 +1346,124 @@ func TestOnChange_DeletionRunsCleanupAndDropsTheFinalizer(t *testing.T) {
 	secret.Annotations[plan.PlanPausedAnnotation] = "true"
 	secret.Annotations[plan.PlanCanceledAnnotation] = "true"
 
-	clusterRef, cluster := newMgmtClusterRef()
-	ts := metav1.NewTime(time.Now())
-	op := alreadyInterrupted(newOp())
-	op.DeletionTimestamp = &ts
-	op.Spec.ClusterRef = clusterRef
+	_, cluster := newMgmtClusterRef()
+	op := newDeletingOp(time.Now())
 
 	var updates []*corev1.Secret
 	secrets := newSecretClient(t, ctrl, &updates, nil, secret)
-
-	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
-	var finalFinalizers []string
-	rotations.EXPECT().Update(gomock.Any()).DoAndReturn(
-		func(o *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) {
-			finalFinalizers = o.Finalizers
-			return o, nil
-		}).Times(1)
+	beacons := &fakeBeaconClient{getObj: &planv1alpha1.Beacon{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "c-m-test",
+			Namespace:   "c-m-test",
+			Annotations: map[string]string{beaconOwnerRefAnnotation: ownerRefFor(op)},
+		},
+		Status: planv1alpha1.BeaconStatus{Active: true, Owner: beaconOwnerKey(op)},
+	}}
 
 	h := &handler{
-		encryptionkeyrotations: rotations,
-		beacons:                &fakeBeaconClient{},
-		secrets:                secrets,
-		store:                  plan.NewStore(secrets),
-		dynamic:                &fakeDynamic{getObj: cluster},
+		beacons: beacons,
+		secrets: secrets,
+		store:   plan.NewStore(secrets),
+		dynamic: &fakeDynamic{getObj: cluster},
 	}
 
-	_, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
+	got, err := h.OnRemove("", op)
 	assert.NoError(t, err)
-	assert.Empty(t, finalFinalizers, "cleanup succeeded, so the finalizer must be dropped")
+	assert.Same(t, op, got, "OnRemove writes Secrets and the Beacon, never the operation")
 
 	if assert.Len(t, updates, 1, "the leftover annotations must be cleared from the machine-plan secret") {
 		assert.NotContains(t, updates[0].Annotations, plan.PlanPausedAnnotation,
 			"a stranded paused annotation halts every plan on the node with no CR left to explain why")
 		assert.NotContains(t, updates[0].Annotations, plan.PlanCanceledAnnotation)
 	}
+
+	if assert.Len(t, beacons.statusUpdates, 1, "the beacon this operation owned must be released") {
+		assert.Empty(t, beacons.statusUpdates[0].Status.Owner)
+		assert.False(t, beacons.statusUpdates[0].Status.Active)
+	}
+
+	// Unlike the other operation types this one also records its owner in a beacon annotation.
+	// Leaving it points at an operation that no longer exists.
+	if assert.Len(t, beacons.updates, 1, "the owner-ref annotation must be cleared too") {
+		assert.NotContains(t, beacons.updates[0].Annotations, beaconOwnerRefAnnotation)
+	}
 }
 
-func TestOnChange_DeletionForceRemovesTheFinalizerOnceTheBudgetIsSpent(t *testing.T) {
+// An owner-ref naming a different operation belongs to that operation. Clearing it would erase the
+// evidence reclaimStaleBeaconOwnerIfNeeded uses to decide whether that owner is still alive.
+func TestOnRemove_LeavesAnotherOperationsOwnerRef(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	clusterRef, _ := newMgmtClusterRef()
-	ts := metav1.NewTime(time.Now().Add(-2 * ops.InterruptCleanupBudget))
-	op := alreadyInterrupted(newOp())
-	op.DeletionTimestamp = &ts
-	op.Spec.ClusterRef = clusterRef
+	_, cluster := newMgmtClusterRef()
+	op := newDeletingOp(time.Now())
+	secrets := newSecretClient(t, ctrl, nil, nil)
+	beacons := &fakeBeaconClient{getObj: &planv1alpha1.Beacon{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        "c-m-test",
+			Namespace:   "c-m-test",
+			Annotations: map[string]string{beaconOwnerRefAnnotation: "fleet-default/other/other-uid"},
+		},
+		Status: planv1alpha1.BeaconStatus{Active: true, Owner: "encryption-key-rotation-other-uid"},
+	}}
 
-	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
-	var finalFinalizers []string
-	rotations.EXPECT().Update(gomock.Any()).DoAndReturn(
-		func(o *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) {
-			finalFinalizers = o.Finalizers
-			return o, nil
-		}).Times(1)
+	h := &handler{
+		beacons: beacons,
+		secrets: secrets,
+		store:   plan.NewStore(secrets),
+		dynamic: &fakeDynamic{getObj: cluster},
+	}
+
+	_, err := h.OnRemove("", op)
+	assert.NoError(t, err)
+	assert.Empty(t, beacons.statusUpdates, "another operation is legitimately driving this cluster")
+	assert.Empty(t, beacons.updates, "the other operation's owner-ref must survive")
+}
+
+// wrangler drops its finalizer only on a nil return, so a retryable failure has to surface as an
+// error or the leftover state is abandoned on the first attempt.
+func TestOnRemove_ReturnsTheErrorWhileTheBudgetRemains(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	_, cluster := newMgmtClusterRef()
+	secrets := ctrlfake.NewMockClientInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secrets.EXPECT().List(gomock.Any(), gomock.Any()).
+		Return(nil, errors.New("etcdserver: request timed out")).AnyTimes()
+
+	h := &handler{
+		beacons: &fakeBeaconClient{},
+		secrets: secrets,
+		store:   plan.NewStore(secrets),
+		dynamic: &fakeDynamic{getObj: cluster},
+	}
+
+	_, err := h.OnRemove("", newDeletingOp(time.Now()))
+	assert.Error(t, err, "the deletion must be requeued rather than give up on the first failure")
+}
+
+func TestOnRemove_GivesUpOnceTheBudgetIsSpent(t *testing.T) {
+	ctrl := gomock.NewController(t)
 
 	secrets := newSecretClient(t, ctrl, nil, nil)
 	h := &handler{
-		encryptionkeyrotations: rotations,
-		beacons:                &fakeBeaconClient{},
-		secrets:                secrets,
-		store:                  plan.NewStore(secrets),
+		beacons: &fakeBeaconClient{},
+		secrets: secrets,
+		store:   plan.NewStore(secrets),
 		// getErr is a permanent, non-NotFound failure: the clusterRef GVK no longer resolves.
 		dynamic: &fakeDynamic{getErr: errors.New("no matches for kind")},
 	}
 
 	logs := captureLogs(t)
 
-	status, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
+	_, err := h.OnRemove("", newDeletingOp(time.Now().Add(-2*ops.CleanupBudget)))
 	assert.NoError(t, err,
 		"an undeletable CR blocks namespace teardown and cluster deprovisioning; a stranded "+
-			"annotation is recoverable with one kubectl command. Force-remove is the lesser failure.")
-	assert.Empty(t, finalFinalizers)
-
-	assert.Equal(t, opv1alpha1.EncryptionKeyRotationStatus{}, status,
-		"a condition written here can never be read: the Update that drops the finalizer makes the "+
-			"framework's UpdateStatus 409, and the next reconcile finds no finalizer and never "+
-			"retries. The log is the only honest channel, so nothing may be written to the status")
+			"annotation is recoverable with one kubectl command. Giving up is the lesser failure.")
 
 	assert.Contains(t, logs.String(), opv1alpha1.InterruptCleanupIncompleteReason,
 		"the log line needs a stable token for alerting to key on")
 	assert.Contains(t, logs.String(),
 		"kubectl get secret -A --field-selector type=rke.cattle.io/machine-plan",
 		"the cluster never resolved, so the operator gets a discovery command rather than a guessed namespace")
-}
-
-func TestOnChange_DeletionWithNoFinalizerIsANoOp(t *testing.T) {
-	ctrl := gomock.NewController(t)
-
-	ts := metav1.NewTime(time.Now())
-	op := newOp()
-	op.DeletionTimestamp = &ts
-
-	secrets := newSecretClient(t, ctrl, nil, nil)
-	h := &handler{secrets: secrets, store: plan.NewStore(secrets)}
-
-	_, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
-	assert.NoError(t, err, "an operation that never wrote an annotation must never be delayed")
 }
 
 // captureLogs redirects logrus for the duration of the test and returns the buffer it writes to.
@@ -1445,47 +1478,60 @@ func captureLogs(t *testing.T) *bytes.Buffer {
 	return &buf
 }
 
-func TestOnChange_DeletionForceRemovalNamesTheSecretsNamespaceNotTheOperations(t *testing.T) {
+// The canonical UI-created operation lives in fleet-default and points at the cluster-scoped mgmt
+// v3 Cluster, while ImportedAdapter.BeaconRef puts the machine-plan Secrets in a namespace named
+// after the cluster. Deriving the command's namespace from the operation would send the operator
+// somewhere with no machine-plan Secrets in it.
+func TestOnRemove_FailureNamesTheSecretsNamespaceNotTheOperations(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	clusterRef, cluster := newMgmtClusterRef()
-	ts := metav1.NewTime(time.Now().Add(-2 * ops.InterruptCleanupBudget))
-	op := alreadyInterrupted(newOp())
-	op.DeletionTimestamp = &ts
-	op.Spec.ClusterRef = clusterRef
+	_, cluster := newMgmtClusterRef()
+	op := newDeletingOp(time.Now().Add(-2 * ops.CleanupBudget))
 	require.Equal(t, "fleet-default", op.Namespace)
-	require.Empty(t, clusterRef.Namespace, "the mgmt v3 Cluster is cluster-scoped")
+	require.Empty(t, op.Spec.ClusterRef.Namespace, "the mgmt v3 Cluster is cluster-scoped")
 
 	// The cluster resolves, so the scope is known; the Secret List is what fails.
 	secrets := ctrlfake.NewMockClientInterface[*corev1.Secret, *corev1.SecretList](ctrl)
 	secrets.EXPECT().List(gomock.Any(), gomock.Any()).
 		Return(nil, errors.New("etcdserver: request timed out")).AnyTimes()
 
-	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
-	rotations.EXPECT().Update(gomock.Any()).DoAndReturn(
-		func(o *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) { return o, nil }).Times(1)
-
 	h := &handler{
-		encryptionkeyrotations: rotations,
-		beacons:                &fakeBeaconClient{},
-		secrets:                secrets,
-		store:                  plan.NewStore(secrets),
-		dynamic:                &fakeDynamic{getObj: cluster},
+		beacons: &fakeBeaconClient{},
+		secrets: secrets,
+		store:   plan.NewStore(secrets),
+		dynamic: &fakeDynamic{getObj: cluster},
 	}
 
 	logs := captureLogs(t)
-	_, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
+	_, err := h.OnRemove("", op)
 	assert.NoError(t, err)
 
 	assert.Contains(t, logs.String(),
 		"kubectl annotate secret -n c-m-test -l rke.cattle.io/cluster-name=c-m-test "+
 			"plan.cattle.io/canceled- plan.cattle.io/paused-",
 		"the command must select exactly the Secrets the cleanup collector reads")
+	assert.Contains(t, logs.String(), "kubectl patch beacon -n c-m-test c-m-test",
+		"a beacon left held wedges the cluster and must be as discoverable as the annotations")
 	assert.NotContains(t, logs.String(), "-n fleet-default",
 		"the operation's own namespace holds no machine-plan Secrets")
 }
 
-func TestOnChange_TheFirstInterruptPersistsTheFinalizerBeforeAnnotatingAnything(t *testing.T) {
+// OnChange must not drive status for a terminating operation. Cleanup belongs to OnRemove, which
+// runs under wrangler's finalizer.
+func TestOnChange_TerminatingOperationDrivesNoStatus(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	secrets := newSecretClient(t, ctrl, nil, nil)
+	h := &handler{secrets: secrets, store: plan.NewStore(secrets)}
+
+	status, err := h.OnChange(newDeletingOp(time.Now()), opv1alpha1.EncryptionKeyRotationStatus{})
+	assert.NoError(t, err)
+	assert.Equal(t, opv1alpha1.EncryptionKeyRotationStatus{}, status)
+}
+
+// The first reconcile that observes an interrupt must annotate immediately. Rancher used to spend
+// this reconcile persisting a finalizer of its own; wrangler's is already in place by now.
+func TestOnChange_TheFirstInterruptAnnotatesImmediately(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	op := newOp()
@@ -1497,16 +1543,12 @@ func TestOnChange_TheFirstInterruptPersistsTheFinalizerBeforeAnnotatingAnything(
 	secrets := newSecretClient(t, ctrl, &updates, nil, newImportedPlanSecret("plan-a", plan.PlanStateInProgress))
 
 	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
-	var written []string
-	rotations.EXPECT().Update(gomock.Any()).DoAndReturn(
-		func(o *opv1alpha1.EncryptionKeyRotation) (*opv1alpha1.EncryptionKeyRotation, error) {
-			written = o.Finalizers
-			return o, nil
-		}).Times(1)
+	rotations.EXPECT().Update(gomock.Any()).Times(0)
+	rotations.EXPECT().EnqueueAfter(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 
 	h := &handler{
 		encryptionkeyrotations: rotations,
-		beacons:                &fakeBeaconClient{getObj: newBeacon("", false)},
+		beacons:                &fakeBeaconClient{getObj: newBeacon(beaconOwnerKey(op), true)},
 		secrets:                secrets,
 		store:                  plan.NewStore(secrets),
 		dynamic:                &fakeDynamic{getObj: cluster},
@@ -1514,17 +1556,17 @@ func TestOnChange_TheFirstInterruptPersistsTheFinalizerBeforeAnnotatingAnything(
 
 	_, err := h.OnChange(op, opv1alpha1.EncryptionKeyRotationStatus{})
 	assert.NoError(t, err)
-	assert.Equal(t, []string{ops.InterruptCleanupFinalizer}, written,
-		"the finalizer has to be persisted before the first annotation, never after")
-	assert.Empty(t, updates,
-		"no machine-plan secret may be annotated on the reconcile that writes the finalizer")
+
+	if assert.Len(t, updates, 1, "the pause must reach the machine-plan secret on this reconcile") {
+		assert.Equal(t, "true", updates[0].Annotations[plan.PlanPausedAnnotation])
+	}
 }
 
-func TestOnChange_TerminalOperationNeverAcquiresTheFinalizer(t *testing.T) {
+// HandleInterrupt returns early for a terminal operation, so pausing one writes no annotation
+// anywhere and its deletion has nothing to undo.
+func TestOnChange_TerminalOperationIsNotInterrupted(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	// HandleInterrupt returns early for a terminal operation, so pausing one writes no annotation
-	// anywhere. A finalizer here would guard nothing.
 	op := newOp()
 	op.Spec.Paused = true
 	clusterRef, cluster := newMgmtClusterRef()
@@ -1534,7 +1576,8 @@ func TestOnChange_TerminalOperationNeverAcquiresTheFinalizer(t *testing.T) {
 	status.SetPhase(opv1alpha1.OperationPhaseSucceeded)
 	op.Status = status
 
-	secrets := newSecretClient(t, ctrl, nil, nil, newImportedPlanSecret("plan-a", plan.PlanStateSucceeded))
+	var updates []*corev1.Secret
+	secrets := newSecretClient(t, ctrl, &updates, nil, newImportedPlanSecret("plan-a", plan.PlanStateSucceeded))
 	rotations := ctrlfake.NewMockControllerInterface[*opv1alpha1.EncryptionKeyRotation, *opv1alpha1.EncryptionKeyRotationList](ctrl)
 	rotations.EXPECT().Update(gomock.Any()).Times(0)
 	rotations.EXPECT().EnqueueAfter(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
@@ -1550,4 +1593,5 @@ func TestOnChange_TerminalOperationNeverAcquiresTheFinalizer(t *testing.T) {
 
 	_, err := h.OnChange(op, status)
 	assert.NoError(t, err)
+	assert.Empty(t, updates, "a terminal operation must not annotate anything")
 }

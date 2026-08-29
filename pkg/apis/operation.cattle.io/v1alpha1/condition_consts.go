@@ -145,9 +145,13 @@ const (
 	// CancelPolicy does not require recovery.
 	TerminationIncompleteReason = "TerminationIncomplete"
 
-	// InterruptCleanupIncompleteReason surfaces when the deletion finalizer exhausted its retry
-	// budget and dropped itself anyway, leaving interrupt annotations on machine-plan Secrets. The
-	// message names the namespace and Secrets so the leftover state is discoverable.
+	// InterruptCleanupIncompleteReason surfaces when deletion cleanup exhausted its retry budget
+	// and let the operation go anyway, leaving interrupt annotations on machine-plan Secrets, the
+	// cluster beacon held, or both. The message names the namespace, Secrets, and beacon so the
+	// leftover state is discoverable.
+	//
+	// It appears only in logs. Nothing can write it to a condition, because the same reconcile
+	// releases the finalizer and the operation is about to disappear.
 	InterruptCleanupIncompleteReason = "InterruptCleanupIncomplete"
 )
 

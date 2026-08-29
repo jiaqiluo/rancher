@@ -30,6 +30,12 @@ const (
 	// ControllerOwnerKey is the value used to identify the etcd-snapshot-save handler currently owns the beacon.
 	ControllerOwnerKey = "etcd-snapshot-save"
 
+	// cleanupHandlerName names the OnRemove handler that undoes this operation's cluster-side
+	// effects. It is persisted data: wrangler derives the finalizer "wrangler.cattle.io/<name>"
+	// from it and writes that onto every operation. Renaming it orphans finalizers on live
+	// objects, which then cannot be deleted.
+	cleanupHandlerName = "etcd-snapshot-save-cleanup"
+
 	// Step hook label prefixes for the etcdsnapshotsave operation. They follow the shared label
 	// semantics documented on planv1alpha1's phase-hook label constants, but each prefix only fires
 	// when the operation enters the matching step.
@@ -112,6 +118,39 @@ func Register(ctx context.Context, clients *wrangler.CAPIContext) {
 	}
 
 	operationcontrollers.RegisterETCDSnapshotSaveStatusHandler(ctx, clients.Operation.ETCDSnapshotSave(), "", "etcd-snapshot-create-handler", h.OnChange)
+
+	// OnRemove owns deletion cleanup. wrangler adds its own finalizer on the first reconcile of
+	// every operation, which is the only way the handler is guaranteed to observe the deletion at
+	// all: an operation with no finalizer is removed by the API server in one transaction, so no
+	// terminating state is ever written and no reconcile can see it.
+	clients.Operation.ETCDSnapshotSave().OnRemove(ctx, cleanupHandlerName, h.OnRemove)
+}
+
+// OnRemove undoes this operation's cluster-side effects: interrupt annotations on machine-plan
+// Secrets, then its hold on the cluster beacon.
+//
+// The beacon half matters because the terminal-phase handlers are the only other release path. An
+// operation deleted while still running owns the beacon with nothing to reclaim it, which wedges
+// every later day-2 operation on that cluster.
+//
+// The operation is returned unmodified. wrangler removes its finalizer from whatever this returns,
+// so handing back a stale copy of an object we had updated would conflict — this handler writes
+// only Secrets and the Beacon, never the operation.
+func (h *handler) OnRemove(_ string, op *opv1alpha1.ETCDSnapshotSave) (*opv1alpha1.ETCDSnapshotSave, error) {
+	if op == nil {
+		return op, nil
+	}
+
+	return op, ops.CleanupOperation(ops.CleanupScope{
+		LogPrefix:  "etcdsnapshotsave",
+		Object:     op,
+		ClusterRef: op.Spec.ClusterRef,
+		Dynamic:    h.dynamic,
+		Clients:    h.clients,
+		Secrets:    h.secrets,
+		Beacons:    h.beacons,
+		OwnerKey:   plan.ControllerOwnerKey(op, ControllerOwnerKey),
+	})
 }
 
 // OnChange is the status handler entrypoint invoked by the wrangler-registered controller. It
@@ -119,30 +158,17 @@ func Register(ctx context.Context, clients *wrangler.CAPIContext) {
 // updateStatus.
 //
 // When the resulting status is byte-identical to the prior status (no state moved this tick), the
-// handler either deletes the operation (terminal phase past its TTL — frees the beacon as a side
-// effect of the watcher seeing the deletion) or re-enqueues itself after 5 seconds so the next
-// poll can pick up any out-of-band changes (plan secret state, beacon transitions, etc.).
+// handler either deletes the operation (terminal phase past its TTL — the OnRemove handler then
+// frees the beacon) or re-enqueues itself after 5 seconds so the next poll can pick up any
+// out-of-band changes (plan secret state, beacon transitions, etc.).
 func (h *handler) OnChange(op *opv1alpha1.ETCDSnapshotSave, status opv1alpha1.ETCDSnapshotSaveStatus) (opv1alpha1.ETCDSnapshotSaveStatus, error) {
 	if op == nil {
 		return status, nil
 	}
+	// A terminating operation has no status left to drive. Cleanup belongs to OnRemove, which runs
+	// under wrangler's finalizer and is the only handler that must not be skipped here.
 	if op.DeletionTimestamp != nil {
-		return status, ops.CleanupInterrupts(ops.InterruptCleanupScope[*opv1alpha1.ETCDSnapshotSave]{
-			LogPrefix:  "etcdsnapshotsave",
-			Object:     op,
-			ClusterRef: op.Spec.ClusterRef,
-			Dynamic:    h.dynamic,
-			Clients:    h.clients,
-			Secrets:    h.secrets,
-			Controller: h.etcdsnapshotsaves,
-		})
-	}
-
-	// Add the cleanup finalizer before the first annotation. If added after, a delete can occur
-	// after the annotation write but before the finalizer persists. The agent will not get a
-	// chance to clean up and the resource may be stranded.
-	if (op.Spec.Paused || op.Spec.Cancel) && !ops.IsTerminal(status.Phase) && !ops.HasInterruptFinalizer(op) {
-		return status, ops.AddInterruptFinalizerAndUpdate(op.DeepCopy(), h.etcdsnapshotsaves.Update)
+		return status, nil
 	}
 
 	status, err := h.onChange(op, status)

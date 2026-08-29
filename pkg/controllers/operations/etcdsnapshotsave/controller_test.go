@@ -177,15 +177,6 @@ func newOp() *opv1alpha1.ETCDSnapshotSave {
 	}
 }
 
-// alreadyInterrupted stamps the cleanup finalizer onto op, standing in for the reconcile that
-// persisted it. The first reconcile to observe spec.paused or spec.cancel writes the finalizer and
-// returns without touching a Secret, so a test that wants to exercise the interrupt itself has to
-// start from the reconcile after that one.
-func alreadyInterrupted(op *opv1alpha1.ETCDSnapshotSave) *opv1alpha1.ETCDSnapshotSave {
-	op.Finalizers = append(op.Finalizers, ops.InterruptCleanupFinalizer)
-	return op
-}
-
 func newBeacon(owner string, active bool) *planv1alpha1.Beacon {
 	// Beacon ownership lives on Status.Owner (the plan.AcquireBeacon helper writes there).
 	// We populate the legacy BeaconOwnerLabel too so any caller that still reads it (e.g.
@@ -461,7 +452,7 @@ func TestOnChange_CancelAnnotatesSecretsAndHoldsPhase(t *testing.T) {
 func TestOnChange_CancelIsNotHeldUpByASecretThatNeverGotAPlan(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	op := alreadyInterrupted(newOp())
+	op := newOp()
 	op.Spec.Cancel = true
 	clusterRef, cluster := newMgmtClusterRef()
 	op.Spec.ClusterRef = clusterRef
@@ -536,7 +527,7 @@ func runStatusHandler(t *testing.T, ctrl *gomock.Controller, h *handler, op *opv
 func TestOnChange_InterruptFailurePersistsTheLatchedEvidence(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	op := alreadyInterrupted(newOp())
+	op := newOp()
 	op.Spec.Cancel = true
 	clusterRef, cluster := newMgmtClusterRef()
 	op.Spec.ClusterRef = clusterRef
@@ -584,7 +575,7 @@ func TestOnChange_InterruptFailurePersistsTheLatchedEvidence(t *testing.T) {
 func TestOnChange_InterruptFailureOnAnEmptyCollectGivesUpAtOnce(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	op := alreadyInterrupted(newOp())
+	op := newOp()
 	op.Spec.Cancel = true
 	clusterRef, cluster := newMgmtClusterRef()
 	op.Spec.ClusterRef = clusterRef
@@ -1350,23 +1341,25 @@ func TestReconcileRestart_FiltersToEtcdSecrets(t *testing.T) {
 	assert.Equal(t, opv1alpha1.OperationPhaseSucceeded, got.Phase, "non-etcd secrets must not be in the iteration")
 }
 
-// --- interrupt-cleanup finalizer -------------------------------------------------------------
+// --- deletion cleanup (OnRemove) ---------------------------------------------------------------
 
-// newDeletingOp returns the canonical operation as a user has just deleted it: terminating,
-// carrying the cleanup finalizer it wrote when it first interrupted the cluster, and pointing at
-// the imported mgmt v3 cluster whose adapter ops.NewAdapter can build without a live wrangler
-// context.
+// newDeletingOp returns the canonical operation as a user has just deleted it: terminating, and
+// pointing at the imported mgmt v3 cluster whose adapter ops.NewAdapter can build without a live
+// wrangler context.
+//
+// No finalizer is set. Rancher does not manage one for this: wrangler stamps
+// wrangler.cattle.io/etcd-snapshot-save-cleanup onto every operation and calls OnRemove under it,
+// so the handler under test never sees or touches a finalizer.
 func newDeletingOp(deletedAt time.Time) *opv1alpha1.ETCDSnapshotSave {
 	op := newOp()
 	ts := metav1.NewTime(deletedAt)
 	op.DeletionTimestamp = &ts
-	op.Finalizers = []string{ops.InterruptCleanupFinalizer}
 	clusterRef, _ := newMgmtClusterRef()
 	op.Spec.ClusterRef = clusterRef
 	return op
 }
 
-func TestOnChange_DeletionRunsCleanupAndDropsTheFinalizer(t *testing.T) {
+func TestOnRemove_ClearsAnnotationsAndReleasesTheBeacon(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	// Both annotations, not just paused. A cancellation that ran to completion leaves the canceled
@@ -1381,53 +1374,92 @@ func TestOnChange_DeletionRunsCleanupAndDropsTheFinalizer(t *testing.T) {
 
 	var updates []*corev1.Secret
 	secrets := newRecordingSecretClient(t, ctrl, &updates, nil, pausedSecret)
-	opClient := ctrlfake.NewMockControllerInterface[*opv1alpha1.ETCDSnapshotSave, *opv1alpha1.ETCDSnapshotSaveList](ctrl)
-
-	var finalFinalizers []string
-	opClient.EXPECT().Update(gomock.Any()).DoAndReturn(
-		func(o *opv1alpha1.ETCDSnapshotSave) (*opv1alpha1.ETCDSnapshotSave, error) {
-			finalFinalizers = o.Finalizers
-			return o, nil
-		}).Times(1)
+	beacons := &fakeBeaconClient{getObj: newBeacon(testOwnerKey, true)}
 
 	h := &handler{
-		etcdsnapshotsaves: opClient,
-		beacons:           &fakeBeaconClient{},
-		secrets:           secrets,
+		beacons: beacons,
+		secrets: secrets,
 		dynamic: &fakeDynamic{gets: map[string]runtime.Object{
 			cluster.GroupVersionKind().String() + "//c-m-test": cluster,
 		}},
 		store: planapi.NewStore(secrets),
 	}
 
-	_, err := h.OnChange(op, opv1alpha1.ETCDSnapshotSaveStatus{})
+	got, err := h.OnRemove("", op)
 	assert.NoError(t, err)
-	assert.Empty(t, finalFinalizers, "cleanup succeeded, so the finalizer must be dropped")
+	assert.Same(t, op, got,
+		"OnRemove writes Secrets and the Beacon, never the operation; wrangler removes its "+
+			"finalizer from whatever this returns, so a stale copy would 409")
 
 	if assert.Len(t, updates, 1, "the leftover annotations must be cleared from the machine-plan secret") {
 		assert.NotContains(t, updates[0].Annotations, planapi.PlanPausedAnnotation,
 			"a stranded paused annotation halts every plan on the node with no CR left to explain why")
 		assert.NotContains(t, updates[0].Annotations, planapi.PlanCanceledAnnotation)
 	}
+
+	// The reason this handler exists. handleSucceeded/handleFailed/handleCanceled are the only
+	// other release path, so an operation deleted while still running would leave a dead owner key
+	// on the beacon and every later day-2 operation on the cluster would wait forever in
+	// AcquireBeacon.
+	if assert.Len(t, beacons.statusUpdates, 1, "the beacon this operation owned must be released") {
+		assert.Empty(t, beacons.statusUpdates[0].Status.Owner)
+		assert.False(t, beacons.statusUpdates[0].Status.Active)
+	}
 }
 
-func TestOnChange_DeletionForceRemovesTheFinalizerOnceTheBudgetIsSpent(t *testing.T) {
+// A beacon driven by some other operation must be left alone: this one simply never acquired it.
+func TestOnRemove_LeavesABeaconItDoesNotHold(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	op := newDeletingOp(time.Now().Add(-2 * ops.InterruptCleanupBudget))
-
-	opClient := ctrlfake.NewMockControllerInterface[*opv1alpha1.ETCDSnapshotSave, *opv1alpha1.ETCDSnapshotSaveList](ctrl)
-	var finalFinalizers []string
-	opClient.EXPECT().Update(gomock.Any()).DoAndReturn(
-		func(o *opv1alpha1.ETCDSnapshotSave) (*opv1alpha1.ETCDSnapshotSave, error) {
-			finalFinalizers = o.Finalizers
-			return o, nil
-		}).Times(1)
+	_, cluster := newMgmtClusterRef()
+	secrets := newSecretClient(t, ctrl)
+	beacons := &fakeBeaconClient{getObj: newBeacon("etcd-snapshot-restore/fleet-default/other", true)}
 
 	h := &handler{
-		etcdsnapshotsaves: opClient,
-		beacons:           &fakeBeaconClient{},
-		secrets:           newSecretClient(t, ctrl),
+		beacons: beacons,
+		secrets: secrets,
+		dynamic: &fakeDynamic{gets: map[string]runtime.Object{
+			cluster.GroupVersionKind().String() + "//c-m-test": cluster,
+		}},
+		store: planapi.NewStore(secrets),
+	}
+
+	_, err := h.OnRemove("", newDeletingOp(time.Now()))
+	assert.NoError(t, err)
+	assert.Empty(t, beacons.statusUpdates, "another operation is legitimately driving this cluster")
+}
+
+// wrangler drops its finalizer only on a nil return, so a retryable failure has to surface as an
+// error or the leftover state is abandoned on the first attempt.
+func TestOnRemove_ReturnsTheErrorWhileTheBudgetRemains(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	_, cluster := newMgmtClusterRef()
+	secrets := ctrlfake.NewMockClientInterface[*corev1.Secret, *corev1.SecretList](ctrl)
+	secrets.EXPECT().List(gomock.Any(), gomock.Any()).
+		Return(nil, errors.New("etcdserver: request timed out")).AnyTimes()
+
+	h := &handler{
+		beacons: &fakeBeaconClient{},
+		secrets: secrets,
+		dynamic: &fakeDynamic{gets: map[string]runtime.Object{
+			cluster.GroupVersionKind().String() + "//c-m-test": cluster,
+		}},
+		store: planapi.NewStore(secrets),
+	}
+
+	_, err := h.OnRemove("", newDeletingOp(time.Now()))
+	assert.Error(t, err, "the deletion must be requeued rather than give up on the first failure")
+}
+
+func TestOnRemove_GivesUpOnceTheBudgetIsSpent(t *testing.T) {
+	ctrl := gomock.NewController(t)
+
+	op := newDeletingOp(time.Now().Add(-2 * ops.CleanupBudget))
+
+	h := &handler{
+		beacons: &fakeBeaconClient{},
+		secrets: newSecretClient(t, ctrl),
 		// getErr is a permanent, non-NotFound failure: the clusterRef GVK no longer resolves.
 		dynamic: &fakeDynamic{getErr: errors.New("no matches for kind")},
 		store:   planapi.NewStore(newSecretClient(t, ctrl)),
@@ -1435,16 +1467,10 @@ func TestOnChange_DeletionForceRemovesTheFinalizerOnceTheBudgetIsSpent(t *testin
 
 	logs := captureLogs(t)
 
-	status, err := h.OnChange(op, opv1alpha1.ETCDSnapshotSaveStatus{})
+	_, err := h.OnRemove("", op)
 	assert.NoError(t, err,
 		"an undeletable CR blocks namespace teardown and cluster deprovisioning; a stranded "+
-			"annotation is recoverable with one kubectl command. Force-remove is the lesser failure.")
-	assert.Empty(t, finalFinalizers)
-
-	assert.Equal(t, opv1alpha1.ETCDSnapshotSaveStatus{}, status,
-		"a condition written here can never be read: the Update that drops the finalizer makes the "+
-			"framework's UpdateStatus 409, and the next reconcile finds no finalizer and never "+
-			"retries. The log is the only honest channel, so nothing may be written to the status")
+			"annotation is recoverable with one kubectl command. Giving up is the lesser failure.")
 
 	assert.Contains(t, logs.String(), opv1alpha1.InterruptCleanupIncompleteReason,
 		"the log line needs a stable token for alerting to key on")
@@ -1453,17 +1479,17 @@ func TestOnChange_DeletionForceRemovesTheFinalizerOnceTheBudgetIsSpent(t *testin
 		"the cluster never resolved, so the operator gets a discovery command rather than a guessed namespace")
 }
 
-// TestOnChange_DeletionForceRemovalNamesTheSecretsNamespaceNotTheOperations covers the one line an
-// operator copies and pastes at the moment Rancher has admitted it cannot fix things itself.
+// TestOnRemove_FailureNamesTheSecretsNamespaceNotTheOperations covers the one line an operator
+// copies and pastes at the moment Rancher has admitted it cannot fix things itself.
 //
 // The canonical UI-created operation lives in fleet-default and points at the cluster-scoped mgmt
 // v3 Cluster (so ClusterRef.Namespace is empty), while ImportedAdapter.BeaconRef puts the
 // machine-plan Secrets in a namespace named after the cluster. Deriving the command's namespace
 // from the operation would send the operator somewhere with no machine-plan Secrets in it.
-func TestOnChange_DeletionForceRemovalNamesTheSecretsNamespaceNotTheOperations(t *testing.T) {
+func TestOnRemove_FailureNamesTheSecretsNamespaceNotTheOperations(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	op := newDeletingOp(time.Now().Add(-2 * ops.InterruptCleanupBudget))
+	op := newDeletingOp(time.Now().Add(-2 * ops.CleanupBudget))
 	require.Equal(t, "fleet-default", op.Namespace)
 	require.Empty(t, op.Spec.ClusterRef.Namespace, "the mgmt v3 Cluster is cluster-scoped")
 
@@ -1474,14 +1500,9 @@ func TestOnChange_DeletionForceRemovalNamesTheSecretsNamespaceNotTheOperations(t
 	secrets.EXPECT().List(gomock.Any(), gomock.Any()).
 		Return(nil, errors.New("etcdserver: request timed out")).AnyTimes()
 
-	opClient := ctrlfake.NewMockControllerInterface[*opv1alpha1.ETCDSnapshotSave, *opv1alpha1.ETCDSnapshotSaveList](ctrl)
-	opClient.EXPECT().Update(gomock.Any()).DoAndReturn(
-		func(o *opv1alpha1.ETCDSnapshotSave) (*opv1alpha1.ETCDSnapshotSave, error) { return o, nil }).Times(1)
-
 	h := &handler{
-		etcdsnapshotsaves: opClient,
-		beacons:           &fakeBeaconClient{},
-		secrets:           secrets,
+		beacons: &fakeBeaconClient{},
+		secrets: secrets,
 		dynamic: &fakeDynamic{gets: map[string]runtime.Object{
 			cluster.GroupVersionKind().String() + "//c-m-test": cluster,
 		}},
@@ -1489,29 +1510,35 @@ func TestOnChange_DeletionForceRemovalNamesTheSecretsNamespaceNotTheOperations(t
 	}
 
 	logs := captureLogs(t)
-	_, err := h.OnChange(op, opv1alpha1.ETCDSnapshotSaveStatus{})
+	_, err := h.OnRemove("", op)
 	assert.NoError(t, err)
 
 	assert.Contains(t, logs.String(),
 		"kubectl annotate secret -n c-m-test -l rke.cattle.io/cluster-name=c-m-test "+
 			"plan.cattle.io/canceled- plan.cattle.io/paused-",
 		"the command must select exactly the Secrets the cleanup collector reads")
+	assert.Contains(t, logs.String(), "kubectl patch beacon -n c-m-test c-m-test",
+		"a beacon left held wedges the cluster and must be as discoverable as the annotations")
 	assert.NotContains(t, logs.String(), "-n fleet-default",
 		"the operation's own namespace holds no machine-plan Secrets")
 }
 
-func TestOnChange_DeletionWithNoFinalizerIsANoOp(t *testing.T) {
+// OnChange must not drive status for a terminating operation. Cleanup belongs to OnRemove, which
+// runs under wrangler's finalizer; doing any of it here as well would double-write.
+func TestOnChange_TerminatingOperationDrivesNoStatus(t *testing.T) {
 	ctrl := gomock.NewController(t)
-	ts := metav1.NewTime(time.Now())
-	op := newOp()
-	op.DeletionTimestamp = &ts
 
 	h := &handler{secrets: newSecretClient(t, ctrl), store: planapi.NewStore(nil)}
-	_, err := h.OnChange(op, opv1alpha1.ETCDSnapshotSaveStatus{})
-	assert.NoError(t, err, "an operation that never wrote an annotation must never be delayed")
+	status, err := h.OnChange(newDeletingOp(time.Now()), opv1alpha1.ETCDSnapshotSaveStatus{})
+	assert.NoError(t, err)
+	assert.Equal(t, opv1alpha1.ETCDSnapshotSaveStatus{}, status)
 }
 
-func TestOnChange_TheFirstInterruptPersistsTheFinalizerBeforeAnnotatingAnything(t *testing.T) {
+// The first reconcile that observes an interrupt must annotate immediately. Rancher used to spend
+// this reconcile persisting a finalizer of its own before it could touch a Secret; wrangler's
+// finalizer is already in place by now, so that round trip is gone and the pause must take effect
+// a reconcile sooner.
+func TestOnChange_TheFirstInterruptAnnotatesImmediately(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
 	op := newOp()
@@ -1524,12 +1551,8 @@ func TestOnChange_TheFirstInterruptPersistsTheFinalizerBeforeAnnotatingAnything(
 		newImportedPlanSecret("plan-a", planapi.PlanStateInProgress))
 
 	opClient := ctrlfake.NewMockControllerInterface[*opv1alpha1.ETCDSnapshotSave, *opv1alpha1.ETCDSnapshotSaveList](ctrl)
-	var written []string
-	opClient.EXPECT().Update(gomock.Any()).DoAndReturn(
-		func(o *opv1alpha1.ETCDSnapshotSave) (*opv1alpha1.ETCDSnapshotSave, error) {
-			written = o.Finalizers
-			return o, nil
-		}).Times(1)
+	opClient.EXPECT().Update(gomock.Any()).Times(0)
+	opClient.EXPECT().EnqueueAfter(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
 
 	h := &handler{
 		etcdsnapshotsaves: opClient,
@@ -1543,19 +1566,17 @@ func TestOnChange_TheFirstInterruptPersistsTheFinalizerBeforeAnnotatingAnything(
 
 	_, err := h.OnChange(op, opv1alpha1.ETCDSnapshotSaveStatus{})
 	assert.NoError(t, err)
-	assert.Equal(t, []string{ops.InterruptCleanupFinalizer}, written,
-		"the finalizer has to be persisted before the first annotation, never after: the window "+
-			"between the two is exactly when a delete strands one")
-	assert.Empty(t, updates,
-		"no machine-plan secret may be annotated on the reconcile that writes the finalizer")
+
+	if assert.Len(t, updates, 1, "the pause must reach the machine-plan secret on this reconcile") {
+		assert.Equal(t, "true", updates[0].Annotations[planapi.PlanPausedAnnotation])
+	}
 }
 
-func TestOnChange_TerminalOperationNeverAcquiresTheFinalizer(t *testing.T) {
+// HandleInterrupt returns early for a terminal operation, so pausing one writes no annotation
+// anywhere and its deletion has nothing to undo.
+func TestOnChange_TerminalOperationIsNotInterrupted(t *testing.T) {
 	ctrl := gomock.NewController(t)
 
-	// HandleInterrupt's first act is to return early for a terminal operation, so pausing one
-	// writes no annotation anywhere. A finalizer here would guard nothing and cost an Update, a
-	// reconcile and a Secret List at deletion time.
 	op := newOp()
 	op.Spec.Paused = true
 	clusterRef, cluster := newMgmtClusterRef()
@@ -1565,7 +1586,9 @@ func TestOnChange_TerminalOperationNeverAcquiresTheFinalizer(t *testing.T) {
 	status.SetPhase(opv1alpha1.OperationPhaseSucceeded)
 	op.Status = status
 
-	secrets := newSecretClient(t, ctrl, newImportedPlanSecret("plan-a", planapi.PlanStateSucceeded))
+	var updates []*corev1.Secret
+	secrets := newRecordingSecretClient(t, ctrl, &updates, nil,
+		newImportedPlanSecret("plan-a", planapi.PlanStateSucceeded))
 	opClient := ctrlfake.NewMockControllerInterface[*opv1alpha1.ETCDSnapshotSave, *opv1alpha1.ETCDSnapshotSaveList](ctrl)
 	opClient.EXPECT().Update(gomock.Any()).Times(0)
 	opClient.EXPECT().EnqueueAfter(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
@@ -1583,6 +1606,7 @@ func TestOnChange_TerminalOperationNeverAcquiresTheFinalizer(t *testing.T) {
 
 	_, err := h.OnChange(op, status)
 	assert.NoError(t, err)
+	assert.Empty(t, updates, "a terminal operation must not annotate anything")
 }
 
 // TestRecreateAfterCancel_UnwedgesTheSecret is the regression test for the delete-and-recreate
