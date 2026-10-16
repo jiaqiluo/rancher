@@ -71,6 +71,21 @@ func escapeShellValue(value string) string {
 	return "'" + escaped + "'"
 }
 
+// windowsAgentEnvVarLine renders a user supplied agent environment variable as one PowerShell statement.
+// PowerShell must not parse the value, so a string value goes into a single quoted literal.
+// A boolean value keeps the $true or $false form. It returns false when the name is not a valid identifier.
+func windowsAgentEnvVarLine(envVar corev1.EnvVar) (string, bool) {
+	name := strings.TrimPrefix(envVar.Name, "$env:")
+	if !isValidShellVarName(name) {
+		return "", false
+	}
+	switch strings.ToLower(envVar.Value) {
+	case "true", "false", "$true", "$false":
+		return capr.FormatWindowsEnvVar(envVar, false), true
+	}
+	return fmt.Sprintf("$env:%s=%s", name, capr.PowerShellQuote(strings.Trim(envVar.Value, "\""))), true
+}
+
 func LinuxInstallScript(ctx context.Context, token string, envVars []corev1.EnvVar, defaultHost, _ string) ([]byte, error) {
 	data, err := installScript(
 		settings.SystemAgentInstallScript,
@@ -209,12 +224,12 @@ func WindowsInstallScript(ctx context.Context, token string, envVars []corev1.En
 		if envVar.Value == "" {
 			continue
 		}
-		if envVar.Name == capr.SystemAgentDataDirEnvVar {
-			// This value comes from spec.dataDirectories.systemAgent, so PowerShell must not parse it.
-			envVarBuf.WriteString(fmt.Sprintf("$env:%s=%s\n", envVar.Name, capr.PowerShellQuote(envVar.Value)))
+		line, ok := windowsAgentEnvVarLine(envVar)
+		if !ok {
+			logrus.Warnf("skipping invalid shell variable name: %q", envVar.Name)
 			continue
 		}
-		envVarBuf.WriteString(capr.FormatWindowsEnvVar(envVar, false) + "\n")
+		envVarBuf.WriteString(line + "\n")
 	}
 	server := ""
 	if settings.ServerURL.Get() != "" {

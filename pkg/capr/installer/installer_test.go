@@ -3,6 +3,10 @@ package installer
 import (
 	"context"
 	"fmt"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/rancher/rancher/pkg/capr"
@@ -309,5 +313,66 @@ func TestInstaller_WindowsInstallScriptQuotesDataDirectory(t *testing.T) {
 				assert.Contains(t, string(script), tt.wantAgentVarDirLine)
 			}
 		})
+	}
+}
+
+func TestWindowsAgentEnvVarLine(t *testing.T) {
+	tests := []struct {
+		name   string
+		envVar corev1.EnvVar
+		want   string
+		wantOK bool
+	}{
+		{name: "string", envVar: corev1.EnvVar{Name: "HTTP_PROXY", Value: "http://proxy:3128"}, want: "$env:HTTP_PROXY='http://proxy:3128'", wantOK: true},
+		{name: "surrounding double quotes are removed", envVar: corev1.EnvVar{Name: "A", Value: `"abc"`}, want: "$env:A='abc'", wantOK: true},
+		{name: "env prefix in name is removed", envVar: corev1.EnvVar{Name: "$env:A", Value: "abc"}, want: "$env:A='abc'", wantOK: true},
+		{name: "bool", envVar: corev1.EnvVar{Name: "FLAG", Value: "true"}, want: "$env:FLAG=$true", wantOK: true},
+		{name: "space", envVar: corev1.EnvVar{Name: "A", Value: "a b"}, want: "$env:A='a b'", wantOK: true},
+		{name: "newline", envVar: corev1.EnvVar{Name: "A", Value: "a\nb"}, want: "$env:A='a\nb'", wantOK: true},
+		{name: "single quote", envVar: corev1.EnvVar{Name: "A", Value: "it's"}, want: "$env:A='it''s'", wantOK: true},
+		{name: "double quote", envVar: corev1.EnvVar{Name: "A", Value: `a"b`}, want: `$env:A='a"b'`, wantOK: true},
+		{name: "backslash", envVar: corev1.EnvVar{Name: "A", Value: `a\b`}, want: `$env:A='a\b'`, wantOK: true},
+		{name: "subexpression", envVar: corev1.EnvVar{Name: "A", Value: "$(calc)"}, want: "$env:A='$(calc)'", wantOK: true},
+		{name: "name with statement", envVar: corev1.EnvVar{Name: "A=1; calc; $env:B", Value: "x"}},
+		{name: "name with space", envVar: corev1.EnvVar{Name: "A B", Value: "x"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := windowsAgentEnvVarLine(tt.envVar)
+			assert.Equal(t, tt.wantOK, ok)
+			assert.Equal(t, tt.want, got)
+		})
+	}
+}
+
+// TestWindowsAgentEnvVarLineRunsAsOneStatement runs the generated line in PowerShell when pwsh is installed.
+func TestWindowsAgentEnvVarLineRunsAsOneStatement(t *testing.T) {
+	pwsh, err := exec.LookPath("pwsh")
+	if err != nil {
+		t.Skip("pwsh is not on PATH")
+	}
+
+	canary := filepath.Join(t.TempDir(), "canary")
+	values := []string{
+		"plain",
+		"a b",
+		"a\nb",
+		"it's",
+		`a"b`,
+		`a\b`,
+		"a\u2018b\u2019c",
+		"$(New-Item " + canary + ")",
+		`x"; New-Item ` + canary + `; "`,
+		"x'; New-Item " + canary + "; '",
+	}
+	for _, v := range values {
+		line, ok := windowsAgentEnvVarLine(corev1.EnvVar{Name: "RANCHER_TEST_VAR", Value: v})
+		assert.True(t, ok)
+		out, err := exec.Command(pwsh, "-NoProfile", "-NonInteractive", "-Command",
+			line+"; [Console]::Out.Write($env:RANCHER_TEST_VAR)").Output()
+		assert.NoError(t, err, "value %q", v)
+		assert.Equal(t, strings.Trim(v, `"`), string(out), "value %q", v)
+		_, err = os.Stat(canary)
+		assert.True(t, os.IsNotExist(err), "value %q ran a second command", v)
 	}
 }
