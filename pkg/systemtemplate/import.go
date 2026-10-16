@@ -8,7 +8,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"text/template"
 
@@ -31,8 +33,39 @@ var (
 	templateFuncMap = sprig.TxtFuncMap()
 	t               = template.Must(template.New("import").Funcs(templateFuncMap).Parse(templateSource))
 	pct             = template.Must(template.New("priorityClass").Funcs(templateFuncMap).Parse(cattleClusterAgentPriorityClassTemplate))
-	pdbt            = template.Must(template.New("podDisruptionBudget").Funcs(templateFuncMap).Parse(cattleClusterPodDisruptionBudgetTemplate))
+	pdbt            = template.Must(template.New("podDisruptionBudget").Funcs(templateFuncMap).Funcs(template.FuncMap{"pdbValue": pdbValue}).Parse(cattleClusterPodDisruptionBudgetTemplate))
 )
+
+// pdbIntegerValue and pdbPercentValue match the two forms that a PodDisruptionBudget accepts.
+var (
+	pdbIntegerValue = regexp.MustCompile(`^[0-9]+$`)
+	pdbPercentValue = regexp.MustCompile(`^[0-9]+%$`)
+)
+
+// isValidPDBValue applies the rules of the Kubernetes API server for minAvailable and maxUnavailable.
+// An integer must not be negative and must fit in an int32. A percentage must not be more than 100%.
+func isValidPDBValue(v string) bool {
+	switch {
+	case pdbIntegerValue.MatchString(v):
+		_, err := strconv.ParseInt(v, 10, 32)
+		return err == nil
+	case pdbPercentValue.MatchString(v):
+		percent, err := strconv.ParseInt(strings.TrimSuffix(v, "%"), 10, 32)
+		return err == nil && percent <= 100
+	}
+	return false
+}
+
+// pdbValue returns v as a YAML scalar. The value comes from the cluster spec, so a line break or
+// YAML syntax in it must not add keys or documents to the manifest. A valid integer or percentage stays
+// unquoted, as before. Any other value is quoted. The API server then rejects the quoted value,
+// because it is a string that is not a percentage.
+func pdbValue(v string) string {
+	if isValidPDBValue(v) {
+		return v
+	}
+	return strconv.Quote(v)
+}
 
 type clusterAgentContext struct {
 	Features             string

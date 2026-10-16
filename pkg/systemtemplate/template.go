@@ -386,10 +386,10 @@ metadata:
   namespace: cattle-system
 spec:
 {{- if .MinAvailable }}
-  minAvailable: {{ .MinAvailable }}
+  minAvailable: {{ .MinAvailable | pdbValue }}
 {{- end }}
 {{- if .MaxUnavailable }}
-  maxUnavailable: {{ .MaxUnavailable }}
+  maxUnavailable: {{ .MaxUnavailable | pdbValue }}
 {{- end }}
   selector:
     matchLabels:
