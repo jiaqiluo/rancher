@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"path"
 	"sort"
+	"strings"
 
 	rkev1 "github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1"
 	"github.com/rancher/rancher/pkg/apis/rke.cattle.io/v1/plan"
@@ -16,6 +18,16 @@ import (
 	"github.com/sirupsen/logrus"
 	corev1 "k8s.io/api/core/v1"
 )
+
+// validateRegistryTLSName returns an error when the registry name moves the TLS files of the registry
+// out of the tls/registries directory. The name comes from a key in spec.registries.configs and is part of a file path
+// that the system-agent writes as root.
+func validateRegistryTLSName(registryName string) error {
+	if !strings.HasPrefix(path.Join("tls/registries", registryName), "tls/registries/") {
+		return fmt.Errorf("registry name [%s] must not point outside of the registry TLS directory", registryName)
+	}
+	return nil
+}
 
 // renderRegistries accepts an RKEControlPlane and generates the data needed to set up registries.
 func (p *Planner) renderRegistries(controlPlane *rkev1.RKEControlPlane) (registries, error) {
@@ -44,6 +56,12 @@ func (p *Planner) renderRegistries(controlPlane *rkev1.RKEControlPlane) (registr
 		if config.InsecureSkipVerify || config.TLSSecretName != "" || len(config.CABundle) > 0 {
 			registryConfig.TLS = &tlsConfig{
 				InsecureSkipVerify: config.InsecureSkipVerify,
+			}
+		}
+
+		if config.TLSSecretName != "" || len(config.CABundle) > 0 {
+			if err := validateRegistryTLSName(registryName); err != nil {
+				return data, err
 			}
 		}
 
