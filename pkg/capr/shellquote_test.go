@@ -134,3 +134,42 @@ func TestPowerShellQuoteRunsAsOneString(t *testing.T) {
 		require.True(t, os.IsNotExist(err), "input %q ran a second command", in)
 	}
 }
+
+func TestShellQuoteAlways(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "/var/lib/rancher/rke2", want: "'/var/lib/rancher/rke2'"},
+		{in: "", want: "''"},
+		{in: "it's", want: `'it'\''s'`},
+		{in: "$(id)", want: "'$(id)'"},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, ShellQuoteAlways(tt.in))
+	}
+}
+
+func TestIsValidEnvVarName(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		want bool
+	}{
+		{name: "HTTP_PROXY", want: true},
+		{name: "_a1", want: true},
+		{name: "", want: false},
+		{name: "1A", want: false},
+		{name: "A B", want: false},
+		{name: "A=1", want: false},
+		{name: "A;id", want: false},
+		{name: "A\nB", want: false},
+		{name: "$env:A", want: false},
+	}
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, IsValidEnvVarName(tt.name), "name %q", tt.name)
+	}
+}

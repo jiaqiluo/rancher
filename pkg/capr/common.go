@@ -403,7 +403,21 @@ func ShellQuote(s string) string {
 	if safe {
 		return s
 	}
+	return ShellQuoteAlways(s)
+}
+
+// ShellQuoteAlways returns s as one literal word for a POSIX shell. It always wraps s in single quotes
+// and escapes each single quote.
+func ShellQuoteAlways(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
+}
+
+var validEnvVarName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// IsValidEnvVarName returns true if name is a valid POSIX shell variable name.
+// Callers must check it before they write a user supplied name into a shell or PowerShell statement.
+func IsValidEnvVarName(name string) bool {
+	return validEnvVarName.MatchString(name)
 }
 
 // PowerShellQuote returns s as one literal string for PowerShell. It uses single quotes and doubles
