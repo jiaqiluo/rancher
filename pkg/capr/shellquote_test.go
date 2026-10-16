@@ -173,3 +173,54 @@ func TestIsValidEnvVarName(t *testing.T) {
 		assert.Equal(t, tt.want, IsValidEnvVarName(tt.name), "name %q", tt.name)
 	}
 }
+
+func TestShellQuoteValue(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "plain value keeps double quotes", in: "http://proxy:3128", want: `"http://proxy:3128"`},
+		{name: "space and equals sign keep double quotes", in: "a b=c", want: `"a b=c"`},
+		{name: "single quote keeps double quotes", in: "it's", want: `"it's"`},
+		{name: "double quote", in: `a"b`, want: `'a"b'`},
+		{name: "dollar", in: "$(id)", want: `'$(id)'`},
+		{name: "backtick", in: "`id`", want: "'`id`'"},
+		{name: "backslash", in: `a\`, want: `'a\'`},
+		{name: "exclamation mark", in: "a!b", want: `'a!b'`},
+		{name: "newline", in: "a\nb", want: "'a\nb'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, ShellQuoteValue(tt.in))
+		})
+	}
+}
+
+func TestPowerShellQuoteValue(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "plain value keeps double quotes", in: "http://proxy:3128", want: `"http://proxy:3128"`},
+		{name: "backslash keeps double quotes", in: `C:\a b`, want: `"C:\a b"`},
+		{name: "single quote keeps double quotes", in: "it's", want: `"it's"`},
+		{name: "double quote", in: `a"b`, want: `'a"b'`},
+		{name: "curly double quotes", in: "a\u201Cb\u201D\u201E", want: "'a\u201Cb\u201D\u201E'"},
+		{name: "subexpression", in: "$(calc)", want: `'$(calc)'`},
+		{name: "backtick", in: "a`nb", want: "'a`nb'"},
+		{name: "newline", in: "a\nb", want: "'a\nb'"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, PowerShellQuoteValue(tt.in))
+		})
+	}
+}

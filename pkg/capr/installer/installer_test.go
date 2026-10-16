@@ -323,15 +323,16 @@ func TestWindowsAgentEnvVarLine(t *testing.T) {
 		want   string
 		wantOK bool
 	}{
-		{name: "string", envVar: corev1.EnvVar{Name: "HTTP_PROXY", Value: "http://proxy:3128"}, want: "$env:HTTP_PROXY='http://proxy:3128'", wantOK: true},
-		{name: "surrounding double quotes are removed", envVar: corev1.EnvVar{Name: "A", Value: `"abc"`}, want: "$env:A='abc'", wantOK: true},
-		{name: "env prefix in name is removed", envVar: corev1.EnvVar{Name: "$env:A", Value: "abc"}, want: "$env:A='abc'", wantOK: true},
+		{name: "string", envVar: corev1.EnvVar{Name: "HTTP_PROXY", Value: "http://proxy:3128"}, want: `$env:HTTP_PROXY="http://proxy:3128"`, wantOK: true},
+		{name: "surrounding double quotes are removed", envVar: corev1.EnvVar{Name: "A", Value: `"abc"`}, want: `$env:A="abc"`, wantOK: true},
+		{name: "env prefix in name is removed", envVar: corev1.EnvVar{Name: "$env:A", Value: "abc"}, want: `$env:A="abc"`, wantOK: true},
 		{name: "bool", envVar: corev1.EnvVar{Name: "FLAG", Value: "true"}, want: "$env:FLAG=$true", wantOK: true},
-		{name: "space", envVar: corev1.EnvVar{Name: "A", Value: "a b"}, want: "$env:A='a b'", wantOK: true},
+		{name: "space", envVar: corev1.EnvVar{Name: "A", Value: "a b"}, want: `$env:A="a b"`, wantOK: true},
 		{name: "newline", envVar: corev1.EnvVar{Name: "A", Value: "a\nb"}, want: "$env:A='a\nb'", wantOK: true},
-		{name: "single quote", envVar: corev1.EnvVar{Name: "A", Value: "it's"}, want: "$env:A='it''s'", wantOK: true},
+		{name: "curly double quote", envVar: corev1.EnvVar{Name: "A", Value: "a\u201Cb"}, want: "$env:A='a\u201Cb'", wantOK: true},
+		{name: "single quote stays in double quotes", envVar: corev1.EnvVar{Name: "A", Value: "it's"}, want: `$env:A="it's"`, wantOK: true},
 		{name: "double quote", envVar: corev1.EnvVar{Name: "A", Value: `a"b`}, want: `$env:A='a"b'`, wantOK: true},
-		{name: "backslash", envVar: corev1.EnvVar{Name: "A", Value: `a\b`}, want: `$env:A='a\b'`, wantOK: true},
+		{name: "backslash", envVar: corev1.EnvVar{Name: "A", Value: `a\b`}, want: `$env:A="a\b"`, wantOK: true},
 		{name: "subexpression", envVar: corev1.EnvVar{Name: "A", Value: "$(calc)"}, want: "$env:A='$(calc)'", wantOK: true},
 		{name: "name with statement", envVar: corev1.EnvVar{Name: "A=1; calc; $env:B", Value: "x"}},
 		{name: "name with space", envVar: corev1.EnvVar{Name: "A B", Value: "x"}},
@@ -374,5 +375,20 @@ func TestWindowsAgentEnvVarLineRunsAsOneStatement(t *testing.T) {
 		assert.Equal(t, strings.Trim(v, `"`), string(out), "value %q", v)
 		_, err = os.Stat(canary)
 		assert.True(t, os.IsNotExist(err), "value %q ran a second command", v)
+	}
+}
+
+// TestWindowsAgentEnvVarLineKeepsExistingOutput pins that a plain value renders as before the quoting change.
+func TestWindowsAgentEnvVarLineKeepsExistingOutput(t *testing.T) {
+	for _, envVar := range []corev1.EnvVar{
+		{Name: "HTTP_PROXY", Value: "http://user:pass@proxy:3128"},
+		{Name: "NO_PROXY", Value: "localhost,127.0.0.1,.svc"},
+		{Name: "FLAG", Value: "true"},
+		{Name: "FLAG", Value: "$false"},
+		{Name: "A", Value: `"quoted"`},
+	} {
+		got, ok := windowsAgentEnvVarLine(envVar)
+		assert.True(t, ok)
+		assert.Equal(t, capr.FormatWindowsEnvVar(envVar, false), got)
 	}
 }

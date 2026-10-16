@@ -6,7 +6,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"regexp"
 	"strings"
 
 	"github.com/rancher/rancher/pkg/capr"
@@ -57,33 +56,19 @@ func installScript(setting settings.Setting, files []string) ([]byte, error) {
 	return io.ReadAll(resp.Body)
 }
 
-// validShellVarName validates that a variable name is a valid POSIX shell identifier.
-var validShellVarName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
-
-// isValidShellVarName returns true if name is a valid POSIX shell variable name.
-func isValidShellVarName(name string) bool {
-	return validShellVarName.MatchString(name)
-}
-
-// escapeShellValue safely escapes a value for use in a POSIX shell script.
-func escapeShellValue(value string) string {
-	escaped := strings.ReplaceAll(value, "'", "'\\''")
-	return "'" + escaped + "'"
-}
-
 // windowsAgentEnvVarLine renders a user supplied agent environment variable as one PowerShell statement.
-// PowerShell must not parse the value, so a string value goes into a single quoted literal.
+// PowerShell must not parse the value, so capr.PowerShellQuoteValue quotes it.
 // A boolean value keeps the $true or $false form. It returns false when the name is not a valid identifier.
 func windowsAgentEnvVarLine(envVar corev1.EnvVar) (string, bool) {
 	name := strings.TrimPrefix(envVar.Name, "$env:")
-	if !isValidShellVarName(name) {
+	if !capr.IsValidEnvVarName(name) {
 		return "", false
 	}
 	switch strings.ToLower(envVar.Value) {
 	case "true", "false", "$true", "$false":
 		return capr.FormatWindowsEnvVar(envVar, false), true
 	}
-	return fmt.Sprintf("$env:%s=%s", name, capr.PowerShellQuote(strings.Trim(envVar.Value, "\""))), true
+	return fmt.Sprintf("$env:%s=%s", name, capr.PowerShellQuoteValue(strings.Trim(envVar.Value, "\""))), true
 }
 
 func LinuxInstallScript(ctx context.Context, token string, envVars []corev1.EnvVar, defaultHost, _ string) ([]byte, error) {
@@ -140,11 +125,11 @@ func LinuxInstallScript(ctx context.Context, token string, envVars []corev1.EnvV
 		if envVar.Value == "" {
 			continue
 		}
-		if !isValidShellVarName(envVar.Name) {
+		if !capr.IsValidEnvVarName(envVar.Name) {
 			logrus.Warnf("skipping invalid shell variable name: %q", envVar.Name)
 			continue
 		}
-		envVarBuf.WriteString(fmt.Sprintf("export %s=%s\n", envVar.Name, escapeShellValue(envVar.Value)))
+		envVarBuf.WriteString(fmt.Sprintf("export %s=%s\n", envVar.Name, capr.ShellQuoteAlways(envVar.Value)))
 	}
 	server := ""
 	if settings.ServerURL.Get() != "" {
